@@ -41,10 +41,38 @@
         etcd_cluster: "centos-patroni-1=http://192.168.122.200:2380,centos-patroni-2=http://192.168.122.201:2380,centos-patroni-3=http://192.168.122.202:2380"
 
     - name: Create systemd service file
-      ansible.builtin.template:
-        src: etcd.service.j2
+      ansible.builtin.copy:
         dest: /etc/systemd/system/etcd.service
         mode: '0644'
+        content: |
+          [Unit]
+          Description=etcd key-value store
+          Documentation=https://etcd.io/docs/
+          After=network.target
+
+          [Service]
+          Environment="TOKEN={{ etcd_token }}"
+          Environment="CLUSTER_STATE=new"
+          Environment="THIS_NAME={{ inventory_hostname }}"
+          Environment="THIS_IP={{ ansible_host }}"
+          Environment="CLUSTER={{ groups['pg_nodes'] | map('extract', hostvars, ['inventory_hostname', 'ansible_host']) | map('regex_replace', '^(.*)$', '\\1=http://\\2:2380') | join(',') }}"
+
+          ExecStart=/usr/bin/etcd \
+            --data-dir={{ etcd_data_dir }} \
+            --name {{ inventory_hostname }} \
+            --initial-advertise-peer-urls http://{{ ansible_host }}:2380 \
+            --listen-peer-urls http://{{ ansible_host }}:2380 \
+            --advertise-client-urls http://{{ ansible_host }}:2379 \
+            --listen-client-urls http://0.0.0.0:2379 \
+            --initial-cluster {{ "{{ CLUSTER }}" }} \
+            --initial-cluster-state {{ "{{ CLUSTER_STATE }}" }} \
+            --initial-cluster-token {{ "{{ TOKEN }}" }}
+
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
 
     - name: Reload systemd configuration
       ansible.builtin.systemd:

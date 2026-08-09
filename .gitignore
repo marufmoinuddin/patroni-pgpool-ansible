@@ -2,9 +2,12 @@
 *.retry
 .vault_pass
 
-# Credentials - NEVER commit this file!
-credentials.yaml
-!credentials.yaml.example
+# variables - NEVER commit this file!
+variables.yaml
+!variables.yaml.example
+
+#hosts.ini
+hosts.ini
 
 # IDE/editor
 .vscode/
