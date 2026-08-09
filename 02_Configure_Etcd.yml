@@ -1,6 +1,25 @@
 ---
-- name: Configure ETCD on PostgreSQL nodes
-  hosts: pg_nodes
+# =============================================================================
+# Configure ETCD (distributed consensus store / Patroni DCS)
+#
+# Resilience fixes applied in this version:
+#  1. Supports a dedicated [etcd_nodes] witness group. Set `etcd_group:
+#     "etcd_nodes"` in variables.yaml to run etcd on dedicated witness hosts so
+#     a DB host crash NEVER touches DCS quorum (etcd runs there, pg_nodes only
+#     run Patroni+PostgreSQL). Default: co-located on pg_nodes (3-node, tolerates
+#     1 failure).
+#  2. Never wipes the etcd data directory on re-runs. The destructive wipe now
+#     only happens when `etcd_force_reset: true` (fresh bootstrap / DR restore).
+#  3. `--initial-cluster-state` is derived from the data directory: `new` on a
+#     fresh bootstrap, `existing` on re-runs/reboots -> members rejoin instead
+#     of failing with mismatched member IDs.
+#  4. The systemd unit uses concrete values (no broken {{ CLUSTER }} env
+#     indirection), waits for network-online.target, raises LimitNOFILE.
+#  5. Preflight guard: refuses to run with the data dir on volatile storage
+#     (tmpfs/ramfs) so state survives reboots.
+# =============================================================================
+- name: Configure ETCD (dedicated witness group or co-located on pg_nodes)
+  hosts: "{{ etcd_group | default('pg_nodes') }}"
   become: true
   gather_facts: true
   vars_files:
@@ -25,21 +44,78 @@
         state: directory
         mode: '0755'
 
-    - name: Remove stale ETCD data (fresh cluster bootstrap)
+    # ----------------------------------------------------------------------
+    # PERSISTENCE GUARD: etcd state MUST survive reboots. Refuse tmpfs/ramfs.
+    # ----------------------------------------------------------------------
+    - name: Detect filesystem type of ETCD data directory
+      ansible.builtin.shell: "findmnt -n -o FSTYPE --target {{ etcd_data_dir }} | tr -d '\\n'"
+      register: etcd_fs
+      changed_when: false
+
+    - name: Refuse volatile storage for etcd data (would lose quorum state on reboot)
+      ansible.builtin.fail:
+        msg: >-
+          etcd_data_dir ({{ etcd_data_dir }}) is on {{ etcd_fs.stdout }} (volatile).
+          Move it to persistent disk - etcd would lose the cluster brain on every reboot.
+      when: etcd_fs.stdout in ['tmpfs', 'ramfs']
+
+    # ----------------------------------------------------------------------
+    # DATA PRESERVATION: stale data is ONLY wiped when explicitly requested.
+    # Re-running this playbook on a healthy cluster must NOT destroy the DCS.
+    # ----------------------------------------------------------------------
+    - name: Find contents of ETCD data directory (for optional forced reset)
       ansible.builtin.find:
         paths: "{{ etcd_data_dir }}"
         file_type: any
       register: etcd_stale
+      when: etcd_force_reset | default(false) | bool
 
-    - name: Wipe ETCD data directory contents
+    - name: Wipe ETCD data directory contents (ONLY when etcd_force_reset=true)
       ansible.builtin.shell: "rm -rf {{ etcd_data_dir }}/*"
-      when: etcd_stale.files | length > 0
+      when: etcd_force_reset | default(false) | bool and etcd_stale.files | length > 0
       changed_when: true
 
-    - name: Set ETCD cluster string (simple approach)
-      ansible.builtin.set_fact:
-        etcd_cluster: "centos-patroni-1=http://192.168.122.200:2380,centos-patroni-2=http://192.168.122.201:2380,centos-patroni-3=http://192.168.122.202:2380"
+    - name: Warn when forcing an etcd reset
+      ansible.builtin.debug:
+        msg: "WARNING: etcd_force_reset=true - wiped {{ etcd_data_dir }}. The Patroni cluster brain is being rebuilt."
+      when: etcd_force_reset | default(false) | bool
 
+    # ----------------------------------------------------------------------
+    # MEMBERSHIP: resolve member hosts and compute cluster strings.
+    # ----------------------------------------------------------------------
+    - name: Resolve etcd member hosts (dedicated etcd_nodes group or pg_nodes)
+      ansible.builtin.set_fact:
+        etcd_member_hosts: "{{ groups[etcd_group] if (etcd_group is defined and etcd_group | length > 0) else groups['pg_nodes'] }}"
+
+    - name: Check for existing etcd member data (after optional reset)
+      ansible.builtin.stat:
+        path: "{{ etcd_data_dir }}/member"
+      register: etcd_member_stat
+
+    - name: Set ETCD initial cluster state (new on fresh bootstrap, existing on re-run/reboot)
+      ansible.builtin.set_fact:
+        etcd_initial_cluster_state: "{{ 'existing' if etcd_member_stat.stat.exists else 'new' }}"
+
+    - name: Build ETCD initial cluster string (name=http://ip:2380, ...)
+      ansible.builtin.set_fact:
+        etcd_initial_cluster: "{% for h in etcd_member_hosts %}{{ hostvars[h]['inventory_hostname'] }}=http://{{ hostvars[h]['ansible_host'] }}:2380{% if not loop.last %},{% endif %}{% endfor %}"
+
+    - name: Build ETCD client endpoint list (http://ip:2379, ...)
+      ansible.builtin.set_fact:
+        etcd_client_endpoints: "{{ etcd_member_hosts | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '^(.*)$', 'http://\\1:2379') | join(',') }}"
+
+    - name: Display ETCD cluster plan
+      ansible.builtin.debug:
+        msg:
+          - "This node: {{ inventory_hostname }} ({{ ansible_host }})"
+          - "Members: {{ etcd_member_hosts }}"
+          - "Initial cluster: {{ etcd_initial_cluster }}"
+          - "Initial cluster state: {{ etcd_initial_cluster_state }}"
+          - "Client endpoints: {{ etcd_client_endpoints }}"
+
+    # ----------------------------------------------------------------------
+    # SYSTEMD UNIT: concrete values, no fragile Environment indirection.
+    # ----------------------------------------------------------------------
     - name: Create systemd service file
       ansible.builtin.copy:
         dest: /etc/systemd/system/etcd.service
@@ -48,15 +124,10 @@
           [Unit]
           Description=etcd key-value store
           Documentation=https://etcd.io/docs/
-          After=network.target
+          After=network-online.target
+          Wants=network-online.target
 
           [Service]
-          Environment="TOKEN={{ etcd_token }}"
-          Environment="CLUSTER_STATE=new"
-          Environment="THIS_NAME={{ inventory_hostname }}"
-          Environment="THIS_IP={{ ansible_host }}"
-          Environment="CLUSTER={{ groups['pg_nodes'] | map('extract', hostvars, ['inventory_hostname', 'ansible_host']) | map('regex_replace', '^(.*)$', '\\1=http://\\2:2380') | join(',') }}"
-
           ExecStart=/usr/bin/etcd \
             --data-dir={{ etcd_data_dir }} \
             --name {{ inventory_hostname }} \
@@ -64,12 +135,13 @@
             --listen-peer-urls http://{{ ansible_host }}:2380 \
             --advertise-client-urls http://{{ ansible_host }}:2379 \
             --listen-client-urls http://0.0.0.0:2379 \
-            --initial-cluster {{ "{{ CLUSTER }}" }} \
-            --initial-cluster-state {{ "{{ CLUSTER_STATE }}" }} \
-            --initial-cluster-token {{ "{{ TOKEN }}" }}
+            --initial-cluster {{ etcd_initial_cluster }} \
+            --initial-cluster-state {{ etcd_initial_cluster_state }} \
+            --initial-cluster-token {{ etcd_token }}
 
           Restart=always
           RestartSec=5
+          LimitNOFILE=65535
 
           [Install]
           WantedBy=multi-user.target
@@ -88,7 +160,9 @@
         name: etcd
         state: started
 
-    # Verification Tasks
+    # ----------------------------------------------------------------------
+    # VERIFICATION
+    # ----------------------------------------------------------------------
     - name: Delay 30 seconds for ETCD service to start
       ansible.builtin.pause:
         seconds: 30
@@ -104,7 +178,7 @@
         var: etcd_status.stdout_lines
 
     - name: Verify cluster member list
-      ansible.builtin.command: "etcdctl --endpoints={{ etcd_endpoints }} member list"
+      ansible.builtin.command: "etcdctl --endpoints={{ etcd_client_endpoints }} member list"
       environment:
         ETCDCTL_API: "3"
       register: member_list
@@ -118,7 +192,7 @@
       run_once: true
 
     - name: Check cluster health
-      ansible.builtin.command: "etcdctl --endpoints={{ etcd_endpoints }} endpoint health"
+      ansible.builtin.command: "etcdctl --endpoints={{ etcd_client_endpoints }} endpoint health"
       environment:
         ETCDCTL_API: "3"
       register: cluster_health

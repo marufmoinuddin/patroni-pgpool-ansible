@@ -1,0 +1,296 @@
+---
+# =============================================================================
+# Deploy cluster self-heal and health monitoring
+#
+# Addresses two resilience gaps:
+#  1. SELF-HEAL: a crashed replica never recovers by itself. A systemd timer
+#     restarts a crashed/stopped/failed LOCAL Patroni member (NEVER the
+#     leader - a leader restart would cause failover; a stale primary would
+#     risk split-brain). Remote crashed members are logged + alerted, and the
+#     manual `patronictl reinit` recovery path is documented in the README.
+#  2. VISIBILITY: a health monitor checks etcd quorum, Patroni leader,
+#     pgpool watchdog quorum and VIP presence every 60s. It writes a log,
+#     optional Prometheus textfile metrics (scraped by PMM's node_exporter),
+#     and fires an optional alert command when the cluster is CRITICAL.
+# =============================================================================
+- name: Deploy cluster self-heal and health monitoring (Patroni, etcd, pgpool watchdog, VIP)
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+  vars_files:
+    - variables.yaml
+  vars:
+    namespace: "{{ namespace | default(patroni_namespace) }}"
+    scope: "{{ patroni_scope }}"
+    etcd_member_hosts: "{{ groups[etcd_group] if (etcd_group is defined and etcd_group | length > 0) else groups['pg_nodes'] }}"
+    etcd_client_endpoints: "{{ etcd_member_hosts | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '^(.*)$', 'http://\\1:2379') | join(',') }}"
+    pgpool_conf_dir: "{{ '/etc/pgpool2' if ansible_os_family == 'Debian' else '/etc/pgpool-II' }}"
+
+  tasks:
+    - name: Ensure log directory exists
+      ansible.builtin.file:
+        path: /var/log/patroni
+        state: directory
+        mode: '0755'
+
+    # ================================================================
+    # 1. PATRONI SELF-HEAL
+    # ================================================================
+    - name: Deploy Patroni self-heal script
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/patroni_self_heal.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # =============================================================================
+          # Patroni self-heal: restart a crashed/stopped/failed LOCAL member.
+          # NEVER restarts the leader. Remote crashed members are reported (and
+          # optionally alerted) but NOT auto-reinitialized - reinit is a manual,
+          # documented operation (see README "Resilience & Self-Healing").
+          # =============================================================================
+          SCOPE="{{ scope }}"
+          PATRONI_CFG="/etc/patroni/patroni.yml"
+          LOG="/var/log/patroni/self_heal.log"
+          LOCK="/var/run/patroni-self-heal.lock"
+          ALERT_CMD="{{ health_alert_command | default('') }}"
+
+          exec 9>"$LOCK"
+          flock -n 9 || exit 0   # only one self-heal run at a time
+
+          exec >> "$LOG" 2>&1
+
+          HOSTNAME_SHORT=$(hostname -s)
+
+          LIST=$(patronictl -c "$PATRONI_CFG" list -f json 2>/dev/null) || {
+            echo "$(date): patronictl failed - is etcd reachable?"
+            exit 1
+          }
+
+          echo "$(date): self-heal check on $HOSTNAME_SHORT"
+          echo "$LIST" | jq -r '.[] | .Member + "|" + .Role + "|" + (.State // "")' | \
+          while IFS='|' read -r member role state; do
+            [ "$member" = "$HOSTNAME_SHORT" ] || continue
+            case "$state" in
+              crashed|stopped|failed)
+                if [ "$role" = "Leader" ]; then
+                  echo "$(date): WARN $member state=$state but is LEADER - refusing to restart (would force a failover / risk split-brain)"
+                  continue
+                fi
+                echo "$(date): member $member state=$state -> restarting patroni"
+                systemctl restart patroni
+                ;;
+              *) ;;
+            esac
+          done
+
+          CRASHED=$(echo "$LIST" | jq -r '[.[] | select(.State == "crashed" or .State == "stopped" or .State == "failed")] | length' 2>/dev/null)
+          if [ "${CRASHED:-0}" -gt 0 ]; then
+            BAD_MEMBERS=$(echo "$LIST" | jq -r '[.[] | select(.State == "crashed" or .State == "stopped" or .State == "failed") | .Member] | join(",")' 2>/dev/null)
+            echo "$(date): WARN $CRASHED member(s) in non-running state: $BAD_MEMBERS"
+            echo "$LIST" | jq -r '.[] | select(.State == "crashed" or .State == "stopped" or .State == "failed") | "  - " + .Member + " (" + .Role + ", " + .State + ")"'
+            if [ -n "$ALERT_CMD" ]; then
+              $ALERT_CMD "Patroni self-heal: $CRASHED member(s) non-running ($BAD_MEMBERS)"
+            fi
+          fi
+
+          exit 0
+
+    - name: Deploy Patroni self-heal systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/patroni-self-heal.service
+        content: |
+          [Unit]
+          Description=Auto-restart crashed local Patroni members (never the leader)
+          After=network-online.target patroni.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/patroni_self_heal.sh
+
+    - name: Deploy Patroni self-heal systemd timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/patroni-self-heal.timer
+        content: |
+          [Unit]
+          Description=Periodically check for crashed Patroni members
+
+          [Timer]
+          OnBootSec=60
+          OnUnitActiveSec=30
+          Unit=patroni-self-heal.service
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable and start Patroni self-heal timer
+      ansible.builtin.systemd:
+        name: patroni-self-heal.timer
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    # ================================================================
+    # 2. CLUSTER HEALTH MONITOR (etcd quorum / leader / watchdog / VIP)
+    # ================================================================
+    - name: Deploy cluster health monitor script
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/cluster_health.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # =============================================================================
+          # Cluster health monitor: etcd quorum, Patroni leader, pgpool watchdog
+          # quorum, backend status and VIP presence.
+          #   - Writes /var/log/patroni/cluster_health.log
+          #   - Writes Prometheus textfile metrics for PMM (if a textfile dir exists)
+          #   - Fires the optional alert command when the cluster is CRITICAL
+          #   - Exit code 0 = healthy, 1 = CRITICAL
+          # =============================================================================
+          SCOPE="{{ scope }}"
+          PATRONI_CFG="/etc/patroni/patroni.yml"
+          ETCD_ENDPOINTS="{{ etcd_client_endpoints }}"
+          VIP="{{ vip_address }}"
+          VIP_IF="{{ vip_interface_override | default(ansible_default_ipv4.interface) }}"
+          PCP_PORT={{ pcp_port }}
+          PCP_USER={{ pcp_user }}
+          PCPPASS={{ pgpool_conf_dir }}/.pcppass
+          LOG="/var/log/patroni/cluster_health.log"
+          ALERT_CMD="{{ health_alert_command | default('') }}"
+          TEXTFILE_DIRS="{{ pmm_textfile_dir | default('') }} /var/lib/pmm-node-exporter/textfile_collector /var/lib/node_exporter/textfile_collector /usr/local/percona/pmm2/collectors/textfile-collector"
+
+          CRITICAL=0
+          NOW=$(date "+%Y-%m-%d %H:%M:%S")
+
+          log() { echo "$NOW $*" >> "$LOG"; }
+
+          # --- etcd -------------------------------------------------------------
+          ETCD_HEALTHY=0; ETCD_QUORUM=0; ETCD_UP=0; ETCD_TOTAL=0
+          for ep in $(echo "$ETCD_ENDPOINTS" | tr ',' ' '); do
+            ETCD_TOTAL=$((ETCD_TOTAL + 1))
+            if ETCDCTL_API=3 etcdctl --endpoints="$ep" endpoint health >/dev/null 2>&1; then
+              ETCD_UP=$((ETCD_UP + 1))
+            fi
+          done
+          [ "$ETCD_UP" -ge 1 ] && ETCD_HEALTHY=1
+          # quorum requires a majority of members
+          ETCD_NEED=$(( (ETCD_TOTAL / 2) + 1 ))
+          [ "$ETCD_UP" -ge "$ETCD_NEED" ] && ETCD_QUORUM=1
+          [ "$ETCD_QUORUM" -ne 1 ] && { CRITICAL=1; log "CRITICAL etcd quorum lost: $ETCD_UP/$ETCD_TOTAL healthy (need $ETCD_NEED)"; }
+
+          # --- Patroni leader ---------------------------------------------------
+          LEADER_PRESENT=0; LEADER_MEMBER=""; MEMBERS_TOTAL=0; MEMBERS_NONRUN=0
+          LIST=$(patronictl -c "$PATRONI_CFG" list -f json 2>/dev/null)
+          if [ -n "$LIST" ]; then
+            LEADER_MEMBER=$(echo "$LIST" | jq -r '[.[] | select(.Role == "Leader")][0].Member // ""' 2>/dev/null)
+            [ -n "$LEADER_MEMBER" ] && [ "$LEADER_MEMBER" != "null" ] && LEADER_PRESENT=1
+            MEMBERS_TOTAL=$(echo "$LIST" | jq -r 'length' 2>/dev/null || echo 0)
+            MEMBERS_NONRUN=$(echo "$LIST" | jq -r '[.[] | select(.State != "running")] | length' 2>/dev/null || echo 0)
+          fi
+          [ "$LEADER_PRESENT" -ne 1 ] && { CRITICAL=1; log "CRITICAL no Patroni leader"; }
+
+          # --- pgpool watchdog + backends ----------------------------------------
+          WD_QUORUM=0
+          export PCPPASSFILE="$PCPPASS"
+          WD_INFO=$(pcp_watchdog_info -v -h localhost -p "$PCP_PORT" -U "$PCP_USER" -w 2>/dev/null)
+          if echo "$WD_INFO" | grep -qi "quorum.*yes"; then
+            WD_QUORUM=1
+          fi
+          [ "$WD_QUORUM" -ne 1 ] && { CRITICAL=1; log "CRITICAL pgpool watchdog quorum lost"; }
+
+          BACKENDS_TOTAL=0; BACKENDS_UP=0
+          BACKENDS_TOTAL=$(pcp_node_count -h localhost -p "$PCP_PORT" -U "$PCP_USER" -w 2>/dev/null || echo 0)
+          if [ "$BACKENDS_TOTAL" -gt 0 ]; then
+            for idx in $(seq 0 $((BACKENDS_TOTAL - 1))); do
+              LINE=$(pcp_node_info -h localhost -p "$PCP_PORT" -U "$PCP_USER" -w "$idx" 2>/dev/null)
+              STATUS=$(echo "$LINE" | awk '{print $5}')
+              [ "$STATUS" = "up" ] && BACKENDS_UP=$((BACKENDS_UP + 1))
+            done
+          fi
+
+          # --- VIP (informational - only the watchdog leader holds it) -------------
+          VIP_PRESENT=0
+          if ip -4 addr show dev "$VIP_IF" 2>/dev/null | grep -Fq "$VIP"; then
+            VIP_PRESENT=1
+          fi
+
+          log "status: leader=$LEADER_MEMBER etcd=$ETCD_UP/$ETCD_TOTAL wd_quorum=$WD_QUORUM backends=$BACKENDS_UP/$BACKENDS_TOTAL vip=$VIP_PRESENT members=$MEMBERS_TOTAL nonrunning=$MEMBERS_NONRUN"
+          if [ "$CRITICAL" -eq 1 ]; then
+            log "RESULT CRITICAL"
+          else
+            log "RESULT OK"
+          fi
+
+          # --- Prometheus textfile metrics (PMM node_exporter scrape) --------------
+          PROM="patroni_leader_present $LEADER_PRESENT
+          patroni_leader{member=\"$LEADER_MEMBER\"} $LEADER_PRESENT
+          patroni_members_total $MEMBERS_TOTAL
+          patroni_members_nonrunning $MEMBERS_NONRUN
+          etcd_healthy $ETCD_HEALTHY
+          etcd_quorum $ETCD_QUORUM
+          pgpool_wd_quorum $WD_QUORUM
+          pgpool_backends_total $BACKENDS_TOTAL
+          pgpool_backends_up $BACKENDS_UP
+          vip_present $VIP_PRESENT
+          "
+          for dir in $TEXTFILE_DIRS; do
+            [ -z "$dir" ] && continue
+            if [ -d "$dir" ]; then
+              echo "$PROM" > "$dir/cluster_health.prom" 2>/dev/null
+            fi
+          done
+
+          # --- alert hook -----------------------------------------------------------
+          if [ "$CRITICAL" -eq 1 ] && [ -n "$ALERT_CMD" ]; then
+            $ALERT_CMD "CLUSTER CRITICAL: etcd_quorum=$ETCD_QUORUM leader=$LEADER_MEMBER wd_quorum=$WD_QUORUM backends=$BACKENDS_UP/$BACKENDS_TOTAL"
+          fi
+
+          exit "$CRITICAL"
+
+    - name: Deploy cluster health monitor systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cluster-health.service
+        content: |
+          [Unit]
+          Description=Cluster health monitor (etcd, Patroni, pgpool watchdog, VIP)
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/cluster_health.sh
+
+    - name: Deploy cluster health monitor systemd timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/cluster-health.timer
+        content: |
+          [Unit]
+          Description=Periodically check cluster health
+
+          [Timer]
+          OnBootSec=90
+          OnUnitActiveSec=60
+          Unit=cluster-health.service
+
+          [Install]
+          WantedBy=timers.target
+
+    - name: Enable and start cluster health timer
+      ansible.builtin.systemd:
+        name: cluster-health.timer
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    # ================================================================
+    # 3. INITIAL HEALTH CHECK
+    # ================================================================
+    - name: Run initial cluster health check
+      ansible.builtin.command: /usr/local/sbin/cluster_health.sh
+      register: health_first
+      changed_when: false
+      failed_when: false
+
+    - name: Display initial health status
+      ansible.builtin.debug:
+        var: health_first.stdout_lines

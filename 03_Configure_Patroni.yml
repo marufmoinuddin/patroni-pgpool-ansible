@@ -28,6 +28,24 @@
       when: ansible_os_family == "RedHat"
 
     # ============================================================
+    # RESILIENCE: namespace alias + etcd member resolution.
+    # `namespace` was previously UNDEFINED (variables.yaml only ships
+    # patroni_namespace) - patroni.yml rendered `namespace: ` empty and the
+    # etcd cleanup keys were wrong. Also, Patroni must talk to ALL etcd
+    # endpoints (dedicated witness group if configured, else co-located
+    # pg_nodes) so DCS access survives a local etcd failure.
+    # ============================================================
+    - name: Resolve namespace alias and etcd member hosts
+      set_fact:
+        namespace: "{{ namespace | default(patroni_namespace) }}"
+        etcd_member_hosts: "{{ groups[etcd_group] if (etcd_group is defined and etcd_group | length > 0) else groups['pg_nodes'] }}"
+
+    - name: Build ETCD client endpoint list for Patroni (client-side DCS redundancy)
+      set_fact:
+        etcd_client_endpoints: "{{ etcd_member_hosts | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '^(.*)$', '\\1:2379') | join(',') }}"
+
+
+    # ============================================================
     # PG TUNE: Calculate optimal PostgreSQL parameters based on VM resources
     # Inspired by https://github.com/le0pard/pgtune
     # ============================================================
@@ -214,7 +232,7 @@
           "/{{ namespace }}/{{ patroni_scope }}/members" \
           "/{{ namespace }}/{{ patroni_scope }}/config"
         do
-          /usr/bin/etcdctl --endpoints="{{ etcd_endpoints }}" del "$key" --prefix
+          /usr/bin/etcdctl --endpoints="{{ etcd_client_endpoints }}" del "$key" --prefix
         done
       ignore_errors: yes
 
@@ -227,7 +245,7 @@
           register: data_dir_stat
 
         - name: Check ETCD keys
-          ansible.builtin.shell: "etcdctl --endpoints='{{ etcd_endpoints }}' get '/{{ namespace }}/{{ scope }}' --prefix | wc -l"
+          ansible.builtin.shell: "etcdctl --endpoints='{{ etcd_client_endpoints }}' get '/{{ namespace }}/{{ scope }}' --prefix | wc -l"
           register: etcd_keys
           ignore_errors: yes
 
@@ -255,6 +273,66 @@
         - { path: "/postgres/pgbackup/kyc/archive", mode: '0700' }
         - { path: "/etc/patroni", mode: '0755' }
         - { path: "{{ pg_socket_dir }}", mode: '0755' }
+        - { path: "/var/log/patroni", mode: '0755' }
+
+    # ============================================================
+    # RESILIENCE: PostgreSQL data must survive reboots - refuse tmpfs/ramfs.
+    # ============================================================
+    - name: Detect filesystem type of PostgreSQL data directory
+      ansible.builtin.shell: "findmnt -n -o FSTYPE --target {{ base_data_dir }} | tr -d '\\n'"
+      register: pg_data_fs
+      changed_when: false
+
+    - name: Refuse volatile storage for PostgreSQL data (would lose all data on reboot)
+      ansible.builtin.fail:
+        msg: >-
+          PostgreSQL data dir ({{ base_data_dir }}) is on {{ pg_data_fs.stdout }} (volatile).
+          Move it to persistent disk - a reboot would destroy the database.
+      when: pg_data_fs.stdout in ['tmpfs', 'ramfs']
+
+    # ============================================================
+    # RESILIENCE: softdog kernel watchdog - self-fencing for a partitioned
+    # primary. Patroni feeds /dev/watchdog; if it loses DCS quorum it stops
+    # feeding and the kernel reboots the host (STONITH-style fencing).
+    # ============================================================
+    - name: Load softdog kernel module (Patroni self-fencing)
+      ansible.builtin.modprobe:
+        name: softdog
+        state: present
+      when: patroni_watchdog | default(true)
+
+    - name: Persist softdog module load across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/softdog.conf
+        content: |
+          softdog
+      when: patroni_watchdog | default(true)
+
+    - name: Give postgres write access to the watchdog device (udev rule)
+      ansible.builtin.copy:
+        dest: /etc/udev/rules.d/99-watchdog.rules
+        content: |
+          KERNEL=="watchdog*", MODE="0666"
+      when: patroni_watchdog | default(true)
+
+    - name: Apply watchdog udev rule and permissions
+      ansible.builtin.shell: |
+        udevadm control --reload-rules && udevadm trigger
+        chmod 666 /dev/watchdog 2>/dev/null || true
+      when: patroni_watchdog | default(true)
+      changed_when: false
+
+    - name: Verify watchdog device is available
+      ansible.builtin.shell: ls -l /dev/watchdog
+      register: watchdog_dev
+      changed_when: false
+      ignore_errors: true
+      when: patroni_watchdog | default(true)
+
+    - name: Display watchdog device
+      ansible.builtin.debug:
+        var: watchdog_dev.stdout
+      when: patroni_watchdog | default(true) and watchdog_dev.stdout is defined
 
     - name: Create Patroni configuration file
       ansible.builtin.blockinfile:
@@ -273,7 +351,20 @@
               connect_address: {{ node_ip }}:8008
 
           etcd3:
-              host: {{ node_ip }}:2379
+              # All etcd endpoints, not just the local one: DCS access survives
+              # a local etcd failure (client-side redundancy).
+              hosts: {{ etcd_client_endpoints }}
+
+          {% if patroni_watchdog | default(true) %}
+          # Self-fencing: if this Patroni loses DCS quorum / becomes partitioned,
+          # it stops feeding the kernel watchdog (softdog) and the host is
+          # rebooted - preventing a stale primary from accepting writes
+          # (split-brain protection).
+          watchdog:
+              mode: automatic
+              device: /dev/watchdog
+              safety_margin: 5
+          {% endif %}
 
           bootstrap:
             dcs:
@@ -395,6 +486,46 @@
     - name: Validate Patroni configuration
       ansible.builtin.command: patroni --validate-config /etc/patroni/patroni.yml
 
+    # ============================================================
+    # RESILIENCE: Patroni must not start before etcd is reachable.
+    # ExecStartPre waits for at least one healthy etcd endpoint so a
+    # reboot never leaves Patroni in a "gave up on DCS" state.
+    # ============================================================
+    - name: Deploy etcd health wait script (Patroni ExecStartPre)
+      ansible.builtin.copy:
+        dest: /usr/local/sbin/wait_for_etcd.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Wait until at least one etcd endpoint accepts connections before
+          # starting Patroni. Dependency-free TCP probe (no etcdctl/curl needed).
+          ENDPOINTS="$1"
+          [ -z "$ENDPOINTS" ] && ENDPOINTS="{{ etcd_client_endpoints }}"
+          TIMEOUT={{ etcd_wait_timeout | default(90) }}
+
+          wait_for_etcd() {
+            local ep host port
+            for ep in $(echo "$ENDPOINTS" | tr ',' ' '); do
+              host="${ep%:*}"
+              port="${ep##*:}"
+              if timeout 2 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          for i in $(seq 1 "$TIMEOUT"); do
+            if wait_for_etcd; then
+              echo "$(date): etcd reachable via $ENDPOINTS after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "ERROR: etcd not reachable after ${TIMEOUT}s (endpoints: $ENDPOINTS)" >&2
+          exit 1
+
     # Systemd Setup
     - name: Create Patroni systemd service
       ansible.builtin.blockinfile:
@@ -406,18 +537,27 @@
         block: |
           [Unit]
           Description=Runners to orchestrate a high-availability PostgreSQL
-          After=syslog.target network.target etcd.service
+          After=syslog.target network-online.target etcd.service
+          Wants=network-online.target
+          {% if etcd_group is not defined or etcd_group | length == 0 %}
+          # etcd is co-located on this node - hard ordering dependency.
+          Requires=etcd.service
+          {% endif %}
 
           [Service]
           Type=simple
           User=postgres
           Group=postgres
+          ExecStartPre=/usr/local/sbin/wait_for_etcd.sh
           ExecStart={{ '/usr/bin/patroni' if ansible_os_family == 'RedHat' else '/bin/patroni' }} /etc/patroni/patroni.yml
           ExecReload=/bin/kill -s HUP $MAINPID
           KillMode=process
           TimeoutSec=30
-          Restart=always
-          RestartSec=10s
+          Restart=on-failure
+          RestartSec=15s
+          # Never let systemd give up on Patroni - it must retry forever
+          # (DCS might come back; a crashed member should self-heal).
+          StartLimitIntervalSec=0
 
           [Install]
           WantedBy=multi-user.target

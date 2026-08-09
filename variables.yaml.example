@@ -14,6 +14,9 @@
 # --- Cluster Identity ---
 patroni_scope: "kyc"
 patroni_namespace: "percona_lab"
+# Alias used by the playbooks for the Patroni namespace prefix (keys under
+# /<namespace>/<scope>). Defaults to patroni_namespace.
+namespace: "{{ patroni_namespace }}"
 cluster_name: "cluster_1"
 
 # --- PostgreSQL / Patroni Users ---
@@ -27,6 +30,10 @@ replicator_password: "CHANGE_ME_REPLICATOR_PASSWORD"
 # Patroni admin user - cluster management via REST API
 patroni_admin_username: "admin"
 patroni_admin_password: "CHANGE_ME_ADMIN_PASSWORD"
+
+# Self-fence a partitioned primary with the kernel softdog watchdog
+# (Patroni stops feeding /dev/watchdog -> host reboots instead of split-brain)
+patroni_watchdog: true
 
 # Percona monitoring user (used by Patroni for health checks)
 percona_username: "percona"
@@ -58,6 +65,17 @@ pgbackrest_repo_path: "/postgres/pgbackup"
 pmm_admin_password: "CHANGE_ME_PMM_ADMIN_PASSWORD"
 pg_pmm_user_password: "CHANGE_ME_PG_PMM_PASSWORD"
 
+# --- Cluster Health Monitoring (07_Configure_Cluster_Health.yml) ---
+# Command executed when the cluster is CRITICAL (etcd quorum lost / no Patroni
+# leader / pgpool watchdog quorum lost). Example:
+#   health_alert_command: "curl -fsS -X POST -H 'Content-Type: application/json' -d '{\"text\":\"$1\"}' https://hooks.example.com/webhook"
+# The message text is passed as the first argument ($1). Empty disables alerting.
+health_alert_command: ""
+# Optional directory where cluster_health.sh drops Prometheus textfile metrics
+# for PMM's node_exporter to scrape. When empty, the script auto-detects the
+# standard PMM textfile directories.
+pmm_textfile_dir: ""
+
 # --- Network / VIP ---
 vip_address: "192.168.122.200"
 # Optional: force a specific NIC for the VIP. Omit to auto-detect the default
@@ -71,6 +89,19 @@ wd_port: 9000
 # Watchdog priority base - used to compute per-node watchdog priorities
 # (higher = more likely to become watchdog leader). Set to 1 on a 3-node cluster.
 wd_priority_base: 1
+
+# Watchdog heartbeat lifecheck port. MUST differ from wd_port (9000).
+# 9694 is the pgpool-II default and is used by the playbooks when unset.
+heartbeat_port: 9694
+
+# Shared watchdog auth key - MUST be identical on all pgpool nodes. Empty
+# disables watchdog authentication (not recommended for production).
+watchdog_authkey: ""
+
+# Exit pgpool when the watchdog loses quorum. Prevents a split-brain VIP
+# (two pgpool instances serving the VIP). 'on' recommended; 'off' keeps
+# pgpool running without quorum (riskier). Debian pgpool2 4.3.5+ supports it.
+pgpool_wd_quorum_exit: on
 
 # --- PostgreSQL Version ---
 pg_version: "16"
@@ -100,6 +131,22 @@ postgres_home_debian: "/var/lib/postgresql"
 etcd_token: "PostgreSQL_HA_Cluster_1"
 etcd_data_dir: "/var/lib/etcd"
 etcd_endpoints: "http://192.168.122.150:2379,http://192.168.122.151:2379,http://192.168.122.152:2379"
+
+# Optional: run etcd on a dedicated witness group instead of the DB hosts.
+# Set etcd_group: "etcd_nodes" and add an [etcd_nodes] group to hosts.ini
+# (odd number of members recommended; 3 witnesses -> tolerates 2 host failures
+# combined across etcd+DB, 5 witnesses -> tolerates 2 etcd failures).
+# When set, pg_nodes only run Patroni+PostgreSQL; DCS quorum is decoupled from
+# DB host crashes. Omit/empty to keep etcd co-located on pg_nodes.
+# etcd_group: "etcd_nodes"
+
+# DANGER: only set to true when you intentionally want to wipe the etcd data
+# directory and rebuild the cluster brain (fresh bootstrap / DR restore).
+# Re-running the playbooks on a healthy cluster must NOT destroy the DCS.
+etcd_force_reset: false
+
+# Seconds Patroni's systemd unit waits for a reachable etcd endpoint before start
+etcd_wait_timeout: 90
 
 # --- Percona Repo ---
 percona_repo_deb_url: "https://repo.percona.com/apt/percona-release_latest.generic_all.deb"

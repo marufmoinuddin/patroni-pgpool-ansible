@@ -29,10 +29,11 @@ You can deploy everything **automatically with Ansible** (recommended), or **ste
 9. [Deployment Method B — Manual (No Ansible)](#9-deployment-method-b--manual-no-ansible)
 10. [Operations Guide — Daily Commands](#10-operations-guide--daily-commands)
 11. [Failure Testing — Learning by Breaking Things](#11-failure-testing--learning-by-breaking-things)
-12. [Troubleshooting Common Issues](#12-troubleshooting-common-issues)
-13. [Security Notes — Change These Before Production](#13-security-notes--change-these-before-production)
-14. [Production Recommendations](#14-production-recommendations)
-15. [External References](#15-external-references)
+12. [Resilience & Self-Healing](#12-resilience--self-healing)
+13. [Troubleshooting Common Issues](#13-troubleshooting-common-issues)
+14. [Security Notes — Change These Before Production](#14-security-notes--change-these-before-production)
+15. [Production Recommendations](#15-production-recommendations)
+16. [External References](#16-external-references)
 
 ---
 
@@ -1667,17 +1668,100 @@ patronictl -c /etc/patroni/patroni.yml list
 
 ---
 
-## 12. Troubleshooting Common Issues
+## 12. Resilience & Self-Healing
+
+This repository applies a set of resilience fixes so the cluster survives
+**single-host loss** without manual intervention, and *tells you* when it can't.
+
+### 12.1 DCS (etcd) Redundancy
+
+| Topology | etcd failure tolerance | What you get |
+|----------|------------------------|--------------|
+| etcd co-located on 3 `pg_nodes` (default) | 1 etcd node | Losing any **2** DB hosts kills quorum → no leader (correct, but fragile) |
+| **etcd on 3 dedicated witnesses** (`etcd_group: "etcd_nodes"`) | 1 etcd node, **plus** a DB host crash never touches quorum | DCS and DB failure domains are decoupled |
+| etcd on **5 witnesses** | 2 etcd nodes | Tolerates two concurrent host losses end-to-end |
+
+To use dedicated witnesses: add an `[etcd_nodes]` group (odd member count) to
+`hosts.ini` and set `etcd_group: "etcd_nodes"` in `variables.yaml`. Playbook
+`02` targets that group; Patroni on `pg_nodes` then talks to **all** etcd
+endpoints (`etcd3.hosts`), so a local etcd failure never blinds Patroni.
+
+### 12.2 Fencing: softdog Watchdog (split-brain protection)
+
+`03_Configure_Patroni.yml` loads the kernel **softdog** module and configures
+Patroni's watchdog (`mode: automatic`, `/dev/watchdog`). If a primary is
+partitioned and loses DCS quorum, Patroni stops feeding the watchdog → the
+kernel **reboots the host** instead of letting a stale primary accept writes.
+Disable with `patroni_watchdog: false` (e.g. on hardware with an external BMC).
+
+### 12.3 Boot Ordering & Restart Policy
+
+- `etcd.service` now waits for `network-online.target`, never has its data
+  directory wiped on re-runs, and uses `initial-cluster-state: existing` when
+  member data already exists (fresh bootstrap still uses `new`).
+- `patroni.service` has `Requires=etcd.service` (co-located mode),
+  `After=network-online.target`, an `ExecStartPre` that **waits up to
+  `etcd_wait_timeout` (90s) for a reachable etcd endpoint**, and
+  `Restart=on-failure` with `StartLimitIntervalSec=0` — it never gives up.
+- `pgpool.service` got `Restart=always` plus `network-online.target` ordering.
+- **Data-dir guards:** playbooks `02`/`03` refuse to run when the etcd or
+  PostgreSQL data directory sits on volatile storage (tmpfs/ramfs) — data must
+  survive reboots.
+
+> ⚠️ Re-running `site.yml` on a healthy cluster **no longer wipes etcd**.
+> Only `etcd_force_reset: true` (fresh bootstrap / DR restore) wipes the DCS.
+
+### 12.4 pgpool Watchdog Hardening
+
+- `heartbeat_port` (default `9694`) is now defined everywhere — it **must
+  differ** from `wd_port` (`9000`) or watchdog heartbeats collide.
+- `wd_quorum_exit = on` (default): a pgpool instance that loses watchdog
+  quorum **exits** instead of serving the VIP alone → no split-brain VIP.
+- `wd_authkey` is configurable via `watchdog_authkey` (identical on all nodes).
+- Duplicate config keys were removed from `pgpool.conf` (last-wins behaviour
+  was a silent trap).
+
+### 12.5 Self-Healing (07_Configure_Cluster_Health.yml)
+
+| Timer | Interval | What it does |
+|-------|----------|--------------|
+| `patroni-self-heal.timer` | 30s | Restarts a **crashed/stopped/failed local** Patroni member. Never touches the leader. Remote crashed members are logged + alerted (manual `patronictl reinit kyc <member>` for corrupt data dirs) |
+| `cluster-health.timer` | 60s | Checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence. Logs to `/var/log/patroni/cluster_health.log`, writes Prometheus textfile metrics for PMM, fires `health_alert_command` on CRITICAL |
+
+Metrics exposed (scraped by PMM's node_exporter textfile collector):
+`patroni_leader_present`, `patroni_leader{member=}`, `patroni_members_total`,
+`patroni_members_nonrunning`, `etcd_healthy`, `etcd_quorum`,
+`pgpool_wd_quorum`, `pgpool_backends_total/up`, `vip_present`.
+
+Set `health_alert_command` (e.g. a webhook curl) in `variables.yaml` to get
+paged *before* an outage becomes permanent.
+
+### 12.6 What About "All Hosts Down"?
+
+No HA topology survives every node dying at once — that is disaster recovery,
+not high availability. Documented restore path: bring etcd up first (members
+with `initial-cluster-state: existing`), then Patroni on one node, then the
+rest — or restore from pgBackRest if data is unrecoverable. The fixes above
+buy you: **losing any single host** (or two, with 5-node etcd) with **no total
+outage**.
+
+---
+
+## 13. Troubleshooting Common Issues
 
 | Issue | Likely Cause | Check / Fix |
 |-------|--------------|-------------|
-| **Patroni won't start** | etcd not reachable | `systemctl status etcd`, `ETCDCTL_API=3 etcdctl endpoint health`; check `patroni.yml` `etcd3.hosts` |
-| **etcd quorum not forming** | Stale data from a previous run | `systemctl stop etcd && rm -rf /var/lib/etcd/* && systemctl start etcd` (fresh bootstrap only!) |
+| **Patroni won't start** | etcd not reachable | `systemctl status etcd`, `ETCDCTL_API=3 etcdctl endpoint health`; check `patroni.yml` `etcd3.hosts` (all endpoints are listed now). `ExecStartPre` waits `etcd_wait_timeout` (90s) before giving up |
+| **etcd quorum not forming** | Stale data from a previous run | On a FRESH bootstrap only: set `etcd_force_reset: true` in variables.yaml and re-run 02 (it wipes + sets `initial-cluster-state: new`). Never `rm -rf /var/lib/etcd/*` on a healthy cluster |
+| **No leader after 2 hosts down** | Expected: 3-node etcd needs a 2/3 majority | That's consensus working correctly. For higher tolerance use `etcd_group: "etcd_nodes"` with 3–5 dedicated witnesses (see §12.1) |
+| **Crashed replica won't recover** | Corrupt data dir or DCS hiccup | `patroni-self-heal.timer` restarts a crashed LOCAL member automatically; for a corrupt data dir run `patronictl -c /etc/patroni/patroni.yml reinit kyc <member>` manually (never auto-reinit) |
+| **Patroni won't start after reboot** | Patroni raced etcd at boot | `ExecStartPre=/usr/local/sbin/wait_for_etcd.sh` waits for DCS; check `journalctl -u patroni` and `/var/log/patroni/cluster_health.log` |
 | **etcd member fails GPG validation** | Fresh OS missing Percona keys | The RPM installs its own key; the playbook uses `disable_gpg_check: true` for the release RPM |
 | **Replicas stuck with lag** | Replication slot missing / WAL removed | `patronictl -c /etc/patroni/patroni.yml list`; check `pg_replication_slots`; a full `pg_basebackup` may be needed |
 | **VIP not moving** | sudoers / capability issues | `sudoers.d/pgpool-vip` entry present? `journalctl -u pgpool` for vip_up/down errors |
-| **Watchdog not forming** | Firewall 9000, auth key mismatch | Open UDP/TCP 9000 between nodes; `wd_authkey` identical everywhere; nodes reachable |
+| **Watchdog not forming** | Firewall 9000, auth key mismatch, heartbeat port collision | Open UDP/TCP 9000 (wd_port) and 9694 (heartbeat_port) between nodes; `wd_authkey` identical everywhere; heartbeat_port MUST differ from wd_port; nodes reachable |
 | **pgpool rejects config** | Unindexed `wd_*` params | Pgpool 4.5+ requires `wd_port0/1/2` (indexed); remove bare `wd_port`, `wd_authkey`, etc. |
+| **Debian installs wrong pgpool** | Percona repo pulls pgpool-II 4.7 libs | Debian MUST use native `pgpool2` 4.3.5: purge `percona-release`/`postgresql-client-common`/`libpgpool2`, `dpkg --configure -a && apt-get -f install`, install native `pgpool2` BEFORE enabling the Percona repo, then `apt-mark hold pgpool2` / pin `4.3.5*` |
 | **Cannot connect via VIP** | VIP on wrong node / pgpool not started | `ip addr` (who owns .200?), `pcp_watchdog_info`, `systemctl status pgpool` |
 | **pool_passwd auth fails** | MD5 vs SCRAM mismatch | This repo uses a plaintext `pool_passwd` + `pool_hba.conf` (SCRAM-safe); keep file perms 600 |
 | **pgBackRest fails** | SSH keys / stanza missing | Run `stanza-create` first; `sudo -iu postgres pgbackrest --stanza=kyc info`; check `repo1-host` |
@@ -1687,7 +1771,7 @@ patronictl -c /etc/patroni/patroni.yml list
 
 ---
 
-## 13. Security Notes — Change These Before Production
+## 14. Security Notes — Change These Before Production
 
 ⚠️ **All secrets are now managed in `variables.yaml` (not in playbooks).** The repository ships with `variables.yaml.example` containing placeholder values. **Copy it to `variables.yaml`, fill in your real passwords, and encrypt with `ansible-vault` before production use:**
 
@@ -1714,7 +1798,7 @@ patronictl -c /etc/patroni/patroni.yml list
 
 ---
 
-## 14. Production Recommendations
+## 15. Production Recommendations
 
 1. **Change the VIP interface** — the playbook defaults to `eth0`; verify with `ip link` and set `vip_interface` accordingly (e.g. `ens3`, `enp1s0`).
 2. **Tune failover timing** — the defaults (`ttl: 30`, `loop_wait: 10`) give ~40s failover. For faster failover, lower `ttl` to 15–20s (but keep it comfortably above `loop_wait`).
@@ -1733,7 +1817,7 @@ patronictl -c /etc/patroni/patroni.yml list
 
 ---
 
-## 15. External References
+## 16. External References
 
 - **Patroni documentation** — https://patroni.readthedocs.io/
 - **Percona Distribution for PostgreSQL** — https://www.percona.com/software/postgresql-distribution

@@ -6,6 +6,21 @@ centos-patroni-3 ansible_host=192.168.122.202 ansible_user=root
 [pg_backrest]
 centos-patroni-4 ansible_host=192.168.122.203 ansible_user=root
 
+# ---------------------------------------------------------------------------
+# OPTIONAL: dedicated etcd/witness nodes (resilience upgrade).
+#
+# To decouple DCS quorum from DB host crashes, add an [etcd_nodes] group with
+# an ODD number of hosts and set `etcd_group: "etcd_nodes"` in variables.yaml.
+# With 3 witnesses, you tolerate a DB host crash + an etcd host crash without
+# losing quorum; with 5 witnesses you tolerate 2 etcd failures (see README
+# "Resilience & Self-Healing"). The etcd playbook (02) then targets THESE
+# hosts and pg_nodes only run Patroni + PostgreSQL.
+#
+# [etcd_nodes]
+# etcd-witness-1 ansible_host=192.168.122.210 ansible_user=root
+# etcd-witness-2 ansible_host=192.168.122.211 ansible_user=root
+# etcd-witness-3 ansible_host=192.168.122.212 ansible_user=root
+
 [all:children]
 pg_nodes
 pg_backrest

@@ -320,11 +320,13 @@
           {% endfor %}
           # Local node priority + auth key (single params, not indexed)
           wd_priority = {{ wd_priority_base + (3 - (node_index | int)) }}
-          wd_authkey = ''
+          wd_authkey = '{{ watchdog_authkey | default('') }}'
+          # Exit pgpool if the watchdog loses quorum (prevents split-brain VIP)
+          wd_quorum_exit = {{ pgpool_wd_quorum_exit | default('on') }}
           # Heartbeat lifecheck (heartbeat_hostnameN/portN/deviceN - same as 4.7)
           {% for node in groups['pg_nodes'] %}
           heartbeat_hostname{{ loop.index0 }} = '{{ hostvars[node]['ansible_host'] }}'
-          heartbeat_port{{ loop.index0 }} = {{ wd_port }}
+          heartbeat_port{{ loop.index0 }} = {{ heartbeat_port | default(9694) }}
           heartbeat_device{{ loop.index0 }} = '{{ vip_interface }}'
           {% endfor %}
           # Virtual IP - 4.3.5 uses delegate_IP (uppercase IP)
@@ -342,11 +344,13 @@
           {% endfor %}
           # Local node priority + auth key (single params, not indexed, in 4.7)
           wd_priority = {{ wd_priority_base + (3 - (node_index | int)) }}
-          wd_authkey = ''
+          wd_authkey = '{{ watchdog_authkey | default('') }}'
+          # Exit pgpool if the watchdog loses quorum (prevents split-brain VIP)
+          wd_quorum_exit = {{ pgpool_wd_quorum_exit | default('on') }}
           # Heartbeat lifecheck - 4.7 names (heartbeat_port MUST differ from wd_port)
           {% for node in groups['pg_nodes'] %}
           heartbeat_hostname{{ loop.index0 }} = '{{ hostvars[node]['ansible_host'] }}'
-          heartbeat_port{{ loop.index0 }} = {{ heartbeat_port }}
+          heartbeat_port{{ loop.index0 }} = {{ heartbeat_port | default(9694) }}
           heartbeat_device{{ loop.index0 }} = '{{ vip_interface }}'
           {% endfor %}
           delegate_ip = '{{ vip }}'
@@ -392,28 +396,8 @@
           logdir = '{{ pgpool_log_dir }}'
 
           # ----------------------------------------------------------------------
-          # HEALTH CHECK SETTINGS (Optimized for Patroni)
+          # FAILOVER SETTINGS (unique keys only - do not duplicate keys above)
           # ----------------------------------------------------------------------
-          # Streaming replication check
-          sr_check_period = 5
-          sr_check_user = '{{ health_check_user }}'
-          sr_check_password = '{{ health_check_password }}'
-          sr_check_database = 'postgres'
-          # Health check
-          health_check_period = 10
-          health_check_timeout = 20
-          health_check_user = '{{ health_check_user }}'
-          health_check_password = '{{ health_check_password }}'
-          health_check_database = 'postgres'
-          health_check_max_retries = 3
-          health_check_retry_delay = 1
-
-          # ----------------------------------------------------------------------
-          # FAILOVER SETTINGS
-          # ----------------------------------------------------------------------
-          failover_command = '{{ pgpool_conf_dir }}/failover.sh %d %h %p %D %m %H %M %P %r %R'
-          failback_command = ''
-          # follow_master_command = '{{ pgpool_conf_dir }}/follow_master.sh %d %h %p %D %m %H %M %P %r %R'
           failover_on_backend_error = on
           search_primary_node_timeout = 10
 
@@ -668,12 +652,14 @@
           {% endfor %}
           # Local node priority + auth key (single params, not indexed, in 4.7)
           wd_priority = {{ wd_priority_base + (3 - (node_index | int)) }}
-          wd_authkey = ''
+          wd_authkey = '{{ watchdog_authkey | default('') }}'
+          # Exit pgpool if the watchdog loses quorum (prevents split-brain VIP)
+          wd_quorum_exit = {{ pgpool_wd_quorum_exit | default('on') }}
 
           # Heartbeat lifecheck - 4.7 names (heartbeat_port MUST differ from wd_port)
           {% for node in groups['pg_nodes'] %}
           heartbeat_hostname{{ loop.index0 }} = '{{ hostvars[node]['ansible_host'] }}'
-          heartbeat_port{{ loop.index0 }} = {{ heartbeat_port }}
+          heartbeat_port{{ loop.index0 }} = {{ heartbeat_port | default(9694) }}
           heartbeat_device{{ loop.index0 }} = '{{ vip_interface }}'
           {% endfor %}
 
@@ -696,11 +682,19 @@
         state: directory
         mode: '0755'
 
-    - name: Create systemd override (VIP capabilities + fast stop + root for heartbeat)
+    - name: Create systemd override (VIP capabilities + fast stop + root for heartbeat + self-heal)
       copy:
         dest: /etc/systemd/system/{{ pgpool_service_name }}.service.d/override.conf
         content: |
+          [Unit]
+          # Never start before the network is fully up (VIP commands need it)
+          After=network-online.target
+          Wants=network-online.target
+
           [Service]
+          # Self-heal: pgpool must come back after a crash/reboot.
+          Restart=always
+          RestartSec=5
           # Pgpool watchdog heartbeat requires euid=0 for SO_BINDTODEVICE
           # (pgpool checks geteuid(), capabilities are NOT sufficient)
           {% if ansible_os_family == "RedHat" %}
@@ -753,9 +747,9 @@
       pause:
         seconds: 15
 
-    - name: Check watchdog status via PCP
+    - name: Check watchdog status via PCP (verbose - shows Quorum state)
       shell: |
-        PCPPASSFILE={{ pgpool_conf_dir }}/.pcppass pcp_watchdog_info -h localhost -p {{ pcp_port }} -U {{ pcp_user }} -w
+        PCPPASSFILE={{ pgpool_conf_dir }}/.pcppass pcp_watchdog_info -v -h localhost -p {{ pcp_port }} -U {{ pcp_user }} -w
       register: wd_info
       changed_when: false
       ignore_errors: true

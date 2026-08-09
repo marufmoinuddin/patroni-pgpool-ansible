@@ -8,3 +8,4 @@
 - import_playbook: 04_Configure_Pgpool.yml
 - import_playbook: 05_Configure_Pgbackrest.yml
 - import_playbook: 06_Install_Pmm_Monitoring.yml
+- import_playbook: 07_Configure_Cluster_Health.yml
