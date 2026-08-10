@@ -31,6 +31,12 @@ PSQL="/usr/pgsql-16/bin/psql"
 if [ -z "${PGPASSWORD:-}" ] && [ -z "${PGPASSFILE:-}" ] && [ -f /etc/pgpool-II/pool_passwd ]; then
     export PGPASSWORD=$(grep "^pgpool_admin:" /etc/pgpool-II/pool_passwd | cut -d: -f2)
 fi
+# Hard connection timeout: if the primary/VIP is down or the node is destroyed,
+# fail FAST (5s) instead of hanging for minutes on an in-flight connect.
+# This is the workload-side parallel of the observer's `timeout 5` guard — without
+# it a killed node stalls the writer indefinitely and no FAILED event is logged
+# (observed: 46-minute hang in Iteration 2, zero outage-window events).
+export PGCONNECT_TIMEOUT=5
 
 mkdir -p "$ARTIFACT_DIR"
 LOG="$ARTIFACT_DIR/txn_${CLIENT}.ids"
