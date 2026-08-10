@@ -624,7 +624,9 @@
         content: |
           #!/bin/bash
           # Re-attach pgpool backend nodes that have recovered but are
-          # still marked down by pgpool (e.g. after a Patroni rejoin).
+          # still marked down by pgpool (e.g. after a Patroni rejoin),
+          # and correct routing-role mismatches when pgpool's routing
+          # role diverges from the actual Patroni primary (pg_role).
           # Runs as postgres (systemd timer), uses .pcppass for PCP auth.
 
           PCP_PORT={{ pcp_port }}
@@ -640,10 +642,25 @@
               # fields: host port status_code weight status pg_status role pg_role ...
               STATUS=$(echo "$LINE" | awk '{print $5}')
               PG_STATUS=$(echo "$LINE" | awk '{print $6}')
+              ROLE=$(echo "$LINE" | awk '{print $7}')
+              PG_ROLE=$(echo "$LINE" | awk '{print $8}')
               HOST=$(echo "$LINE" | awk '{print $1}')
+
+              # Case 1: backend recovered (pg_status=up) but pgpool marks it down
               if [ "$STATUS" = "down" ] && [ "$PG_STATUS" = "up" ]; then
                   echo "$(date): Re-attaching node $idx ($HOST) - backend up, pgpool marked down"
                   pcp_attach_node -h localhost -p $PCP_PORT -U $PCP_USER -w $idx >> "$LOG_FILE" 2>&1
+                  continue
+              fi
+
+              # Case 2: routing role is stale. sr_check reports the true
+              # primary via pg_role, but pgpool's routing role (role) only
+              # updates on failover events. If the actual primary
+              # (pg_role=primary) is not the routing target, promote it.
+              if [ "$STATUS" = "up" ] && [ "$PG_STATUS" = "up" ] && \
+                 [ "$PG_ROLE" = "primary" ] && [ "$ROLE" != "primary" ]; then
+                  echo "$(date): Correcting routing role - node $idx ($HOST) is actual primary (pg_role=$PG_ROLE) but routing role=$ROLE"
+                  pcp_promote_node -h localhost -p $PCP_PORT -U $PCP_USER -w $idx >> "$LOG_FILE" 2>&1
               fi
           done
 
