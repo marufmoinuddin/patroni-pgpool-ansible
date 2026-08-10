@@ -12,14 +12,17 @@
 # nodes reporting false = split-brain — flagged by the post-processing.
 #
 # USAGE
-#   ./step4_observer.sh <artifact_dir> [iterations] [poll_secs]
-#   e.g. ./step4_observer.sh ~/deploy/artifacts/step3 120 2
+#   ./step4_observer.sh <artifact_dir> [iterations] [poll_secs] [pool_host_ip]
+#   e.g. ./step4_observer.sh ~/deploy/artifacts/step3 300 2 192.168.122.150
+#   default iterations=300 (10 min @ 2s = matches workload duration),
+#   default pool host = db1 (a NON-TARGET survivor; never the node being killed)
 # ============================================================================
 set -u
 
 ARTIFACT_DIR="${1:?artifact dir required}"
-ITERATIONS="${2:-120}"
+ITERATIONS="${2:-300}"
 POLL_SECS="${3:-2}"
+POOL_HOST_IP="${4:-192.168.122.150}"   # db1 by default — change per iteration
 
 mkdir -p "$ARTIFACT_DIR"
 OUT="$ARTIFACT_DIR/observe_iter.log"
@@ -27,8 +30,8 @@ OUT="$ARTIFACT_DIR/observe_iter.log"
 
 NODES=(db1 db2 db3)
 declare -A NODE_IP=( [db1]="192.168.122.150" [db2]="192.168.122.151" [db3]="192.168.122.152" )
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
-PCPOOL_HOST="192.168.122.151"   # any node with pgpool for the pool_nodes read
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2"
+POOL_HOST="$POOL_HOST_IP"   # any SURVIVOR node with pgpool for the pool_nodes read
 # Helper scripts pre-shipped to each node (avoids fragile nested quoting).
 REC_HELPER="/tmp/node_recovery.sh"
 POOL_HELPER="/tmp/pool_nodes.sh"
@@ -47,8 +50,8 @@ for ((i=1; i<=ITERATIONS; i++)); do
         LINE="$LINE $n.recovery=$R"
     done
 
-    # Pooled routing view (pgpool)
-    P=$(ssh $SSH_OPTS "root@$PCPOOL_HOST" "bash $POOL_HELPER" \
+    # Pooled routing view (pgpool) — from the configured SURVIVOR node
+    P=$(ssh $SSH_OPTS "root@$POOL_HOST" "bash $POOL_HELPER" \
         2>/dev/null | tr -d '[:space:]')
     LINE="$LINE pool=[$P]"
 
