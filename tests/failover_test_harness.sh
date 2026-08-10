@@ -28,9 +28,13 @@
 #   ./failover_test_harness.sh --targets db2 --action stop --execute
 #   ./failover_test_harness.sh --targets db1 --action kill --allow-leader --execute
 #   ./failover_test_harness.sh --targets db2 db3 --action restart --execute
+#   ./failover_test_harness.sh --targets db2 --action vm-destroy --allow-leader --execute
+#   ./failover_test_harness.sh --targets db2 --action vm-start --execute
 #
 # ACTIONS (allowed set; anything else is refused):
 #   stop | restart | kill        -> systemctl stop/restart/kill patroni on each target
+#   vm-destroy | vm-start        -> virsh destroy/start <vm> on the VPS hypervisor
+#                                   (VM short-name == NODE_MAP key, e.g. db2 -> db2)
 #   status                       -> read-only cluster status (no gate needed)
 # ============================================================================
 set -u
@@ -48,7 +52,8 @@ MGMT_HOST="144.79.249.124"
 MGMT_USER="maruf"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15"
 
-LOG_FILE="/var/log/patroni/failover_harness.log"
+LOG_FILE="${FAILOVER_LOG_FILE:-$HOME/.hermes/logs/failover_harness.log}"
+mkdir -p "$(dirname "$LOG_FILE")"
 PATRONI_CFG="/etc/patroni/patroni.yml"
 
 # --- Parse arguments --------------------------------------------------------
@@ -94,8 +99,8 @@ for t in "${TARGETS[@]}"; do
 done
 
 case "$ACTION" in
-    stop|restart|kill|status) ;;
-    *) echo "ERROR: invalid/empty action '$ACTION'. Allowed: stop|restart|kill|status"; exit 2 ;;
+    stop|restart|kill|status|vm-destroy|vm-start) ;;
+    *) echo "ERROR: invalid/empty action '$ACTION'. Allowed: stop|restart|kill|status|vm-destroy|vm-start"; exit 2 ;;
 esac
 
 # --- Leader guard -----------------------------------------------------------
@@ -135,7 +140,14 @@ fi
 if [ $EXECUTE -eq 0 ]; then
     echo "[dry-run] Would execute:"
     for t in "${TARGETS[@]}"; do
-        echo "    ssh ... root@${NODE_MAP[$t]} 'systemctl $ACTION patroni'"
+        case "$ACTION" in
+            vm-destroy|vm-start)
+                echo "    ssh ... $MGMT_USER@$MGMT_HOST 'virsh ${ACTION#vm-} $t'"
+                ;;
+            *)
+                echo "    ssh ... root@${NODE_MAP[$t]} 'systemctl $ACTION patroni'"
+                ;;
+        esac
     done
     echo "[dry-run] No nodes touched. Re-run with --execute to act."
     exit 0
@@ -143,7 +155,7 @@ fi
 
 # --- Confirmation gate --------------------------------------------------------
 echo ""
-echo "DESTRUCTIVE ACTION AHEAD: systemctl $ACTION patroni on: ${TARGETS[*]}"
+echo "DESTRUCTIVE ACTION AHEAD: $ACTION on: ${TARGETS[*]}"
 for t in "${TARGETS[@]}"; do
     echo "  - $t (${NODE_MAP[$t]})"
 done
@@ -159,16 +171,36 @@ done
 # --- Execute ----------------------------------------------------------------
 for t in "${TARGETS[@]}"; do
     log "EXECUTE $ACTION on $t (${NODE_MAP[$t]})"
-    ssh $SSH_OPTS "$MGMT_USER@$MGMT_HOST" \
-        "ssh $SSH_OPTS root@${NODE_MAP[$t]} 'systemctl $ACTION patroni; echo RC=\$?'"
+    case "$ACTION" in
+        vm-destroy|vm-start)
+            # VM actions run virsh on the hypervisor (MGMT_HOST); node is a VM
+            # short-name, e.g. db2 == domain 'db2'.
+            ssh $SSH_OPTS "$MGMT_USER@$MGMT_HOST" "virsh ${ACTION#vm-} $t; echo RC=\$?"
+            ;;
+        *)
+            ssh $SSH_OPTS "$MGMT_USER@$MGMT_HOST" \
+                "ssh $SSH_OPTS root@${NODE_MAP[$t]} 'systemctl $ACTION patroni; echo RC=\$?'"
+            ;;
+    esac
     log "Done $ACTION on $t"
     sleep 2
 done
 
 # --- Post-action verification --------------------------------------------------
 echo ""
-echo "=== POST-ACTION CLUSTER STATE ==="
-ssh $SSH_OPTS "$MGMT_USER@$MGMT_HOST" \
-    "ssh $SSH_OPTS root@${NODE_MAP[${TARGETS[0]}]} \
-     'patronictl -c $PATRONI_CFG list'"
+echo "=== POST-ACTION STATE ==="
+case "$ACTION" in
+    vm-destroy|vm-start)
+        # Node may be powered off (destroy) or booting (start): query virsh
+        # state instead of SSH. Cluster state is read by the observer poll.
+        for t in "${TARGETS[@]}"; do
+            ssh $SSH_OPTS "$MGMT_USER@$MGMT_HOST" "virsh domstate $t; echo RC=\$?"
+        done
+        ;;
+    *)
+        ssh $SSH_OPTS "$MGMT_USER@$MGMT_HOST" \
+            "ssh $SSH_OPTS root@${NODE_MAP[${TARGETS[0]}]} \
+             'patronictl -c $PATRONI_CFG list'"
+        ;;
+esac
 exit 0
