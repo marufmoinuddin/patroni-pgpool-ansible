@@ -6,8 +6,9 @@
 variables.yaml
 !variables.yaml.example
 
-#hosts.ini
+# Inventories - deployment-specific, never commit
 hosts.ini
+hosts
 
 # IDE/editor
 .vscode/

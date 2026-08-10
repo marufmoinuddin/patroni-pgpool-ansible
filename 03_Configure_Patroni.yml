@@ -296,9 +296,10 @@
     # feeding and the kernel reboots the host (STONITH-style fencing).
     # ============================================================
     - name: Load softdog kernel module (Patroni self-fencing)
-      ansible.builtin.modprobe:
-        name: softdog
-        state: present
+      ansible.builtin.command: modprobe softdog
+      register: softdog_modprobe
+      changed_when: false
+      failed_when: softdog_modprobe.rc != 0
       when: patroni_watchdog | default(true)
 
     - name: Persist softdog module load across reboots

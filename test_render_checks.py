@@ -265,7 +265,7 @@ def main():
     health = render_block(blocks["Deploy cluster health monitor script"])
     check("health monitor checks etcd quorum (majority math)", "ETCD_NEED=$(( (ETCD_TOTAL / 2) + 1 ))" in health)
     check("health monitor checks leader presence", "select(.Role == \"Leader\")" in health)
-    check("health monitor checks pgpool wd quorum", 'grep -qi "quorum.*yes"' in health)
+    check("health monitor checks pgpool wd quorum", 'grep -qi "quorum.*exist"' in health)
     check("health monitor writes textfile metrics", "cluster_health.prom" in health)
     check("health monitor alert hook", "CLUSTER CRITICAL" in health)
     check("health monitor PCPPASS per-OS", "PCPPASS=/etc/pgpool-II/.pcppass" in health)

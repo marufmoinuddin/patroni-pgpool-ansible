@@ -344,6 +344,28 @@
         line: "{{ pgbackrest_pubkey.stdout }}"
         state: present
 
+    # DB -> backup direction: pgBackRest archive-push runs ON the pg_nodes and
+    # SSHes to the repo host (repo1-host).  Each pg_node's public key must be
+    # present in the pg_backrest host's authorized_keys, otherwise
+    # "postgres@percona-pgbackrest: Permission denied (publickey)" aborts every
+    # WAL archive and the pgbackrest verification backup times out.
+    # NOTE: this MUST be run_once + loop. A per-node delegated lineinfile would
+    # race on the shared authorized_keys file (concurrent read-modify-write
+    # loses entries), leaving random nodes unable to reach the repo host.
+    - name: Get local pg_node public key (for repo-host auth)
+      command: cat {{ ssh_dir }}/id_rsa.pub
+      register: pg_node_pubkey
+      changed_when: false
+
+    - name: Add ALL pg_node public keys to pgBackRest host authorized_keys
+      lineinfile:
+        path: "{{ ssh_dir }}/authorized_keys"
+        line: "{{ hostvars[item]['pg_node_pubkey'].stdout }}"
+        state: present
+      delegate_to: "{{ groups['pg_backrest'][0] }}"
+      run_once: true
+      loop: "{{ groups['pg_nodes'] }}"
+
     # Create pgBackRest configuration
     - name: Create pgBackRest configuration file
       copy:
@@ -460,12 +482,16 @@
       register: pg_node_pubkey
       changed_when: false
 
-    - name: Add PostgreSQL node public key to pgBackRest server authorized_keys
+    # Same race-guard as in the pg_nodes play: add all keys in ONE delegated
+    # run_once task instead of per-node parallel writes to the shared file.
+    - name: Add ALL PostgreSQL node public keys to pgBackRest server authorized_keys
       authorized_key:
         user: postgres
-        key: "{{ pg_node_pubkey.stdout }}"
+        key: "{{ hostvars[item]['pg_node_pubkey'].stdout }}"
         state: present
       delegate_to: "{{ groups['pg_backrest'][0] }}"
+      run_once: true
+      loop: "{{ groups['pg_nodes'] }}"
 
     # Set up SSH known_hosts to prevent interactive prompts for each pg_node to backrest server
     - name: Add pgBackRest host to known_hosts

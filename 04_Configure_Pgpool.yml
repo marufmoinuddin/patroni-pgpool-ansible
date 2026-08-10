@@ -141,23 +141,71 @@
 
     - name: Create Pgpool users in PostgreSQL (on current primary only)
       block:
-        - name: Create pgpool_admin user
-          shell: |
-            su - postgres -c "{{ psql_path }} -c \"CREATE USER {{ pgpool_admin_user }} WITH SUPERUSER PASSWORD '{{ pgpool_admin_password }}';\" || {{ psql_path }} -c \"ALTER USER {{ pgpool_admin_user }} WITH SUPERUSER PASSWORD '{{ pgpool_admin_password }}';\""
+        - name: Create pgpool_admin user - SQL file
+          ansible.builtin.copy:
+            dest: /tmp/pgpool_admin.sql
+            content: |
+              DO $body$
+              BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ pgpool_admin_user }}') THEN
+                  CREATE ROLE {{ pgpool_admin_user }} WITH LOGIN SUPERUSER PASSWORD '{{ pgpool_admin_password }}';
+                ELSE
+                  ALTER ROLE {{ pgpool_admin_user }} WITH LOGIN SUPERUSER PASSWORD '{{ pgpool_admin_password }}';
+                END IF;
+              END
+              $body$;
+          delegate_to: "{{ patroni_leader }}"
+          run_once: true
+
+        - name: Run pgpool_admin user creation SQL
+          ansible.builtin.shell: |
+            su - postgres -c "{{ psql_path }} -f /tmp/pgpool_admin.sql"
           delegate_to: "{{ patroni_leader }}"
           run_once: true
           ignore_errors: true
 
-        - name: Create pcp user (for PCP commands)
-          shell: |
-            su - postgres -c "{{ psql_path }} -c \"CREATE USER {{ pcp_user }} WITH SUPERUSER PASSWORD '{{ pcp_password }}';\" || {{ psql_path }} -c \"ALTER USER {{ pcp_user }} WITH SUPERUSER PASSWORD '{{ pcp_password }}';\""
+        - name: Create pcp user (for PCP commands) - SQL file
+          ansible.builtin.copy:
+            dest: /tmp/pcp_user.sql
+            content: |
+              DO $body$
+              BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ pcp_user }}') THEN
+                  CREATE ROLE {{ pcp_user }} WITH LOGIN SUPERUSER PASSWORD '{{ pcp_password }}';
+                ELSE
+                  ALTER ROLE {{ pcp_user }} WITH LOGIN SUPERUSER PASSWORD '{{ pcp_password }}';
+                END IF;
+              END
+              $body$;
+          delegate_to: "{{ patroni_leader }}"
+          run_once: true
+
+        - name: Run pcp user creation SQL
+          ansible.builtin.shell: |
+            su - postgres -c "{{ psql_path }} -f /tmp/pcp_user.sql"
           delegate_to: "{{ patroni_leader }}"
           run_once: true
           ignore_errors: true
 
-        - name: Create health check user (pgpool)
-          shell: |
-            su - postgres -c "{{ psql_path }} -c \"CREATE USER {{ health_check_user }} WITH PASSWORD '{{ health_check_password }}';\" || {{ psql_path }} -c \"ALTER USER {{ health_check_user }} WITH PASSWORD '{{ health_check_password }}';\""
+        - name: Create health check user (pgpool) - SQL file
+          ansible.builtin.copy:
+            dest: /tmp/health_check_user.sql
+            content: |
+              DO $body$
+              BEGIN
+                IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ health_check_user }}') THEN
+                  CREATE ROLE {{ health_check_user }} WITH LOGIN PASSWORD '{{ health_check_password }}';
+                ELSE
+                  ALTER ROLE {{ health_check_user }} WITH LOGIN PASSWORD '{{ health_check_password }}';
+                END IF;
+              END
+              $body$;
+          delegate_to: "{{ patroni_leader }}"
+          run_once: true
+
+        - name: Run health check user creation SQL
+          ansible.builtin.shell: |
+            su - postgres -c "{{ psql_path }} -f /tmp/health_check_user.sql"
           delegate_to: "{{ patroni_leader }}"
           run_once: true
           ignore_errors: true
@@ -181,13 +229,15 @@
       notify: restart pgpool
 
     # pcp.conf: requires MD5-hashed password (pgpool 4.x)
+    # NOTE: hash computed via Ansible filter (NOT shell pg_md5) so passwords
+    # containing shell metacharacters like '$' are hashed correctly.
     - name: Create pcp.conf (MD5-hashed password)
-      shell: |
-        HASH=$(pg_md5 {{ pcp_password }})
-        echo "{{ pcp_user }}:$HASH" > {{ pgpool_conf_dir }}/pcp.conf
-        chown postgres:postgres {{ pgpool_conf_dir }}/pcp.conf
-        chmod 0640 {{ pgpool_conf_dir }}/pcp.conf
-      changed_when: false
+      ansible.builtin.copy:
+        dest: "{{ pgpool_conf_dir }}/pcp.conf"
+        content: "{{ pcp_user }}:{{ pcp_password | hash('md5') }}\n"
+        owner: postgres
+        group: postgres
+        mode: '0640'
       notify: restart pgpool
 
     # .pcppass: plaintext credentials so pcp_* commands run non-interactively
@@ -297,6 +347,16 @@
           health_check_max_retries = 3
           health_check_retry_delay = 1
           connect_timeout = 10
+
+          # Streaming replication check (REQUIRED: find_primary_node uses
+          # sr_check_user/password to detect the primary; unset values cause
+          # "no PostgreSQL user name specified in startup packet" and the
+          # pool rejects all client connections)
+          sr_check_period = 10
+          sr_check_user = '{{ health_check_user }}'
+          sr_check_password = '{{ health_check_password }}'
+          sr_check_database = 'postgres'
+          delay_threshold = 10000000
 
           # Failover / Failback
           failover_command = '{{ pgpool_conf_dir }}/failover.sh %d %h %p %D %m %H %M %P %r %R'
@@ -457,7 +517,6 @@
           LOG_FILE="{{ pgpool_log_dir }}/failover.log"
           PATRONI_CONFIG="/etc/patroni/patroni.yml"
           PCP_USER="{{ pcp_user }}"
-          PCP_PASS="{{ pcp_password }}"
           PCP_PORT={{ pcp_port }}
 
           exec >> "$LOG_FILE" 2>&1
@@ -573,8 +632,9 @@
           export PCPPASSFILE={{ pgpool_conf_dir }}/.pcppass
           LOG_FILE="{{ pgpool_log_dir }}/reattach.log"
 
-          # Number of backends to check (max 6, covers 3-node + backup)
-          for idx in 0 1 2 3 4 5; do
+          # Number of backends to check (exactly matches the pg_nodes group)
+          NUM_BACKENDS={{ groups['pg_nodes'] | length }}
+          for idx in $(seq 0 $(( NUM_BACKENDS - 1 ))); do
               LINE=$(pcp_node_info -h localhost -p $PCP_PORT -U $PCP_USER -w $idx 2>/dev/null)
               [ -z "$LINE" ] && continue
               # fields: host port status_code weight status pg_status role pg_role ...

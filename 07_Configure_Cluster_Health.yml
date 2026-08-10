@@ -193,7 +193,8 @@
           WD_QUORUM=0
           export PCPPASSFILE="$PCPPASS"
           WD_INFO=$(pcp_watchdog_info -v -h localhost -p "$PCP_PORT" -U "$PCP_USER" -w 2>/dev/null)
-          if echo "$WD_INFO" | grep -qi "quorum.*yes"; then
+          # pgpool 4.x reports "Quorum state: QUORUM EXIST" (not "quorum yes")
+          if echo "$WD_INFO" | grep -qi "quorum.*exist"; then
             WD_QUORUM=1
           fi
           [ "$WD_QUORUM" -ne 1 ] && { CRITICAL=1; log "CRITICAL pgpool watchdog quorum lost"; }
@@ -208,9 +209,11 @@
             done
           fi
 
-          # --- VIP (informational - only the watchdog leader holds it) -------------
+          # --- VIP (informational - only the watchdog leader holds it) ---
+          # Use the actual watchdog interface (from wd_monitoring_interfaces_list)
+          VIP_IFACE="$(echo "$WD_INFO" | grep -i 'monitoring.*interface' | head -1 | awk '{print $NF}' | tr -d '[]' | tr -d ',' || echo "$VIP_IF")"
           VIP_PRESENT=0
-          if ip -4 addr show dev "$VIP_IF" 2>/dev/null | grep -Fq "$VIP"; then
+          if ip -4 addr show dev "$VIP_IFACE" 2>/dev/null | grep -Fq "$VIP"; then
             VIP_PRESENT=1
           fi
 

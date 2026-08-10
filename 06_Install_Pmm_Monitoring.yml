@@ -325,7 +325,7 @@
   tasks:
     - name: Configure PMM Client
       shell: |
-        pmm-admin config --server-insecure-tls --server-url=https://admin:{{ pmm_admin_password }}@{{ pmm_server_host }}:{{ pmm_server_port }} --force
+        pmm-admin config --server-insecure-tls --server-url=https://admin:'{{ pmm_admin_password }}'@{{ pmm_server_host }}:{{ pmm_server_port }} --force
       register: pmm_config
       changed_when: "'OK' in pmm_config.stdout"
       failed_when: "pmm_config.rc != 0 and 'already configured' not in pmm_config.stderr"
@@ -336,7 +336,7 @@
     - name: Add PostgreSQL monitoring
       shell: |
         pmm-admin remove postgresql || true
-        pmm-admin add postgresql --username=pmm --password={{ pg_pmm_user_password }} --skip-connection-check
+        pmm-admin add postgresql --username=pmm --password='{{ pg_pmm_user_password }}' --skip-connection-check
       register: pmm_add
       changed_when: "'OK' in pmm_add.stdout"
       failed_when: "pmm_add.rc != 0 and 'already exists' not in pmm_add.stderr and 'not found' not in pmm_add.stderr"
