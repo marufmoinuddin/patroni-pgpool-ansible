@@ -185,7 +185,7 @@
             LEADER_MEMBER=$(echo "$LIST" | jq -r '[.[] | select(.Role == "Leader")][0].Member // ""' 2>/dev/null)
             [ -n "$LEADER_MEMBER" ] && [ "$LEADER_MEMBER" != "null" ] && LEADER_PRESENT=1
             MEMBERS_TOTAL=$(echo "$LIST" | jq -r 'length' 2>/dev/null || echo 0)
-            MEMBERS_NONRUN=$(echo "$LIST" | jq -r '[.[] | select(.State != "running")] | length' 2>/dev/null || echo 0)
+            MEMBERS_NONRUN=$(echo "$LIST" | jq -r '[.[] | select(.State != "running" and .State != "streaming")] | length' 2>/dev/null || echo 0)
           fi
           [ "$LEADER_PRESENT" -ne 1 ] && { CRITICAL=1; log "CRITICAL no Patroni leader"; }
 
