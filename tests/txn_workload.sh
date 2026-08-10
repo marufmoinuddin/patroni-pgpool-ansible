@@ -35,7 +35,8 @@ fi
 mkdir -p "$ARTIFACT_DIR"
 LOG="$ARTIFACT_DIR/txn_${CLIENT}.ids"
 STATE="$ARTIFACT_DIR/txn_${CLIENT}.state"
-touch "$LOG"
+EVENTS="$ARTIFACT_DIR/txn_${CLIENT}.events"
+touch "$LOG" "$EVENTS"
 
 # Recover last confirmed id if resuming (allows restart mid-test)
 LAST_ID=0
@@ -57,8 +58,8 @@ while [ $(( $(date +%s) - START )) -lt "$DURATION" ]; do
     OUT=$("$PSQL" -h "$VIP" -p "$PORT" -U "$USER" -d "$DB" \
           -v ON_ERROR_STOP=1 -tA \
           -c "INSERT INTO txn_track(id, client, ts) VALUES ($ID, '$CLIENT', now()) RETURNING id;" 2>&1) \
-        && { echo "$ID" >> "$LOG"; CONFIRMED=$((CONFIRMED + 1)); NEXT_ID=$((NEXT_ID + 1)); } \
-        || { echo "FAILED id=$ID: $(echo "$OUT" | head -1)" >> "$ARTIFACT_DIR/txn_${CLIENT}.log"; FAILED=$((FAILED + 1)); }
+        && { echo "$ID" >> "$LOG"; echo "$(date -u +%FT%TZ) CONFIRMED $ID" >> "$EVENTS"; CONFIRMED=$((CONFIRMED + 1)); NEXT_ID=$((NEXT_ID + 1)); } \
+        || { echo "$(date -u +%FT%TZ) FAILED $ID: $(echo "$OUT" | head -1)" >> "$EVENTS"; echo "FAILED id=$ID: $(echo "$OUT" | head -1)" >> "$ARTIFACT_DIR/txn_${CLIENT}.log"; FAILED=$((FAILED + 1)); }
 
     # Small pacing gap: keeps connection churn bounded; adjust if load needs
     # to be higher. 0.02s ~ 50 txn/s per client.
