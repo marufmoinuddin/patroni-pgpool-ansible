@@ -628,14 +628,44 @@
           # and correct routing-role mismatches when pgpool's routing
           # role diverges from the actual Patroni primary (pg_role).
           # Runs as postgres (systemd timer), uses .pcppass for PCP auth.
+          #
+          # SAFETY (Case 2 role correction) - hardened against thrash:
+          #   - Acts ONLY when Patroni (the authoritative leader source,
+          #     guaranteed single by etcd lease) confirms this node is
+          #     the Leader. A transient sr_check read showing two nodes
+          #     as pg_role=primary during a promotion cannot trigger
+          #     a promote on the old primary, because Patroni will not
+          #     name it Leader.
+          #   - Requires the same mismatch to be stable across 2
+          #     consecutive timer runs (state file), so a momentary
+          #     read during a race window is never acted upon.
+          #   - Performs at most ONE correction per run.
 
           PCP_PORT={{ pcp_port }}
           PCP_USER={{ pcp_user }}
           export PCPPASSFILE={{ pgpool_conf_dir }}/.pcppass
           LOG_FILE="{{ pgpool_log_dir }}/reattach.log"
+          STATE_FILE="{{ pgpool_log_dir }}/reattach_state"
+
+          # Authoritative Patroni leader - the single source of truth.
+          PATRONI_LEADER_IP=""
+          PATRONI_LEADER_MEMBER=""
+          while IFS= read -r LINE; do
+              ROLE=$(echo "$LINE" | jq -r '.Role')
+              if [ "$ROLE" = "Leader" ]; then
+                  PATRONI_LEADER_IP=$(echo "$LINE" | jq -r '.Host')
+                  PATRONI_LEADER_MEMBER=$(echo "$LINE" | jq -r '.Member')
+              fi
+          done < <(patronictl -c /etc/patroni/patroni.yml list -f json 2>/dev/null)
+          if [ -n "$PATRONI_LEADER_MEMBER" ]; then
+              echo "$(date): Patroni Leader confirmed: $PATRONI_LEADER_MEMBER ($PATRONI_LEADER_IP)"
+          else
+              echo "$(date): WARN - could not determine Patroni Leader, skipping Case 2 role corrections this run"
+          fi
 
           # Number of backends to check (exactly matches the pg_nodes group)
           NUM_BACKENDS={{ groups['pg_nodes'] | length }}
+          NEW_MISMATCH=0
           for idx in $(seq 0 $(( NUM_BACKENDS - 1 ))); do
               LINE=$(pcp_node_info -h localhost -p $PCP_PORT -U $PCP_USER -w $idx 2>/dev/null)
               [ -z "$LINE" ] && continue
@@ -653,17 +683,34 @@
                   continue
               fi
 
-              # Case 2: routing role is stale. sr_check reports the true
-              # primary via pg_role, but pgpool's routing role (role) only
-              # updates on failover events. If the actual primary
-              # (pg_role=primary) is not the routing target, promote it.
+              # Case 2: routing role is stale. Requires ALL of:
+              #   1. backend up and pgpool marks it up
+              #   2. sr_check says pg_role=primary
+              #   3. routing role != primary (the mismatch)
+              #   4. Patroni authoritatively confirms THIS node is Leader
+              #      (blocks the old primary during split-brain window)
+              #   5. same mismatch seen on the previous run (stability)
               if [ "$STATUS" = "up" ] && [ "$PG_STATUS" = "up" ] && \
-                 [ "$PG_ROLE" = "primary" ] && [ "$ROLE" != "primary" ]; then
-                  echo "$(date): Correcting routing role - node $idx ($HOST) is actual primary (pg_role=$PG_ROLE) but routing role=$ROLE"
-                  pcp_promote_node -h localhost -p $PCP_PORT -U $PCP_USER -w $idx >> "$LOG_FILE" 2>&1
+                 [ "$PG_ROLE" = "primary" ] && [ "$ROLE" != "primary" ] && \
+                 [ "$HOST" = "$PATRONI_LEADER_IP" ]; then
+                  if grep -q "^MISMATCH:$idx$" "$STATE_FILE" 2>/dev/null; then
+                      echo "$(date): Correcting routing role - node $idx ($HOST) confirmed Patroni Leader ($PATRONI_LEADER_MEMBER), mismatch stable across 2 runs"
+                      pcp_promote_node -h localhost -p $PCP_PORT -U $PCP_USER -w $idx >> "$LOG_FILE" 2>&1
+                      echo "$(date): Role correction performed - exiting (one correction per run)"
+                      : > "$STATE_FILE"
+                      exit 0
+                  else
+                      echo "$(date): Node $idx ($HOST) pg_role=primary but routing role=$ROLE - mismatch observed, awaiting confirmation run"
+                      echo "MISMATCH:$idx" > "$STATE_FILE"
+                      NEW_MISMATCH=1
+                  fi
               fi
           done
 
+          # No stable mismatch recorded this run - reset state
+          if [ "$NEW_MISMATCH" -eq 0 ]; then
+              : > "$STATE_FILE"
+          fi
           exit 0
 
     - name: Deploy auto-reattach systemd service
