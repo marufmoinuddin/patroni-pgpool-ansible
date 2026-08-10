@@ -210,8 +210,10 @@
           fi
 
           # --- VIP (informational - only the watchdog leader holds it) ---
-          # Use the actual watchdog interface (from wd_monitoring_interfaces_list)
-          VIP_IFACE="$(echo "$WD_INFO" | grep -i 'monitoring.*interface' | head -1 | awk '{print $NF}' | tr -d '[]' | tr -d ',' || echo "$VIP_IF")"
+          # Detect the interface that actually holds the delegate IP (VIP)
+          # pcp_watchdog_info -v does not reliably expose the monitoring interface,
+          # so we find the interface with the VIP address directly.
+          VIP_IFACE="$(ip -4 addr show | grep -B2 "$VIP" | grep -E '^[0-9]+:' | head -1 | awk '{print $2}' | tr -d ':' || echo "$VIP_IF")"
           VIP_PRESENT=0
           if ip -4 addr show dev "$VIP_IFACE" 2>/dev/null | grep -Fq "$VIP"; then
             VIP_PRESENT=1
