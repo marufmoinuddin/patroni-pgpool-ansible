@@ -213,9 +213,9 @@
           # Detect the interface that actually holds the delegate IP (VIP)
           # pcp_watchdog_info -v does not reliably expose the monitoring interface,
           # so we find the interface with the VIP address directly.
-          VIP_IFACE="$(ip -4 addr show | grep -B2 "$VIP" | grep -E '^[0-9]+:' | head -1 | awk '{print $2}' | tr -d ':' || echo "$VIP_IF")"
+          VIP_IFACE="$(ip -4 addr show | awk -v vip=\"$VIP\" '/^[0-9]+:/ {iface=$2; gsub(/:/, \"\", iface)} index($0, vip) {print iface; exit}' || echo \"$VIP_IF\")"
           VIP_PRESENT=0
-          if ip -4 addr show dev "$VIP_IFACE" 2>/dev/null | grep -Fq "$VIP"; then
+          if [ -n "$VIP_IFACE" ] && ip -4 addr show dev "$VIP_IFACE" 2>/dev/null | grep -Fq "$VIP"; then
             VIP_PRESENT=1
           fi
 
