@@ -13,14 +13,16 @@
 #
 # USAGE
 #   ./step4_observer.sh <artifact_dir> [iterations] [poll_secs] [pool_host_ip]
-#   e.g. ./step4_observer.sh ~/deploy/artifacts/step3 300 2 192.168.122.150
-#   default iterations=300 (10 min @ 2s = matches workload duration),
+#   e.g. ./step4_observer.sh ~/deploy/artifacts/step3 720 2 192.168.122.151
+#   default iterations=720 (24 min @ 2s — 2x longest observed outage+rejoin span),
 #   default pool host = db1 (a NON-TARGET survivor; never the node being killed)
 # ============================================================================
 set -u
 
 ARTIFACT_DIR="${1:?artifact dir required}"
-ITERATIONS="${2:-300}"
+ITERATIONS="${2:-720}"   # default 720 (24 min @ 2s) — covers the longest observed
+                          # outage+rejoin span (~12 min) with 2x margin; hang bug
+                          # (ServerAliveInterval) is fixed so long windows are free.
 POLL_SECS="${3:-2}"
 POOL_HOST_IP="${4:-192.168.122.150}"   # db1 by default — change per iteration
 
