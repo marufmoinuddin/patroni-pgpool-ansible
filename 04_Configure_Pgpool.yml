@@ -648,15 +648,15 @@
           STATE_FILE="{{ pgpool_log_dir }}/reattach_state"
 
           # Authoritative Patroni leader - the single source of truth.
+          # patronictl -f json emits one compact JSON array on a single line,
+          # so select the Leader directly with jq rather than line-splitting.
           PATRONI_LEADER_IP=""
           PATRONI_LEADER_MEMBER=""
-          while IFS= read -r LINE; do
-              ROLE=$(echo "$LINE" | jq -r '.Role')
-              if [ "$ROLE" = "Leader" ]; then
-                  PATRONI_LEADER_IP=$(echo "$LINE" | jq -r '.Host')
-                  PATRONI_LEADER_MEMBER=$(echo "$LINE" | jq -r '.Member')
-              fi
-          done < <(patronictl -c /etc/patroni/patroni.yml list -f json 2>/dev/null)
+          PATRONI_LEADER_JSON=$(patronictl -c /etc/patroni/patroni.yml list -f json 2>/dev/null | jq -c '.[] | select(.Role == "Leader")' | head -1)
+          if [ -n "$PATRONI_LEADER_JSON" ]; then
+              PATRONI_LEADER_IP=$(echo "$PATRONI_LEADER_JSON" | jq -r '.Host')
+              PATRONI_LEADER_MEMBER=$(echo "$PATRONI_LEADER_JSON" | jq -r '.Member')
+          fi
           if [ -n "$PATRONI_LEADER_MEMBER" ]; then
               echo "$(date): Patroni Leader confirmed: $PATRONI_LEADER_MEMBER ($PATRONI_LEADER_IP)"
           else
