@@ -1170,7 +1170,7 @@ health_check_user = 'pgpool'
 health_check_password = 'CHANGE_ME_HEALTH'
 
 # Streaming replication check
-sr_check_period = 10
+sr_check_period = 3
 sr_check_user = 'pgpool'
 sr_check_password = 'CHANGE_ME_HEALTH'
 delay_threshold = 1048576
@@ -1250,7 +1250,7 @@ health_check_user = 'pgpool'
 health_check_password = 'CHANGE_ME_HEALTH'
 
 # Streaming replication check
-sr_check_period = 10
+sr_check_period = 3
 sr_check_user = 'pgpool'
 sr_check_password = 'CHANGE_ME_HEALTH'
 delay_threshold = 1048576

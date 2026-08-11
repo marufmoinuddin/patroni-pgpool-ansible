@@ -202,6 +202,8 @@ def main():
     check("etcd3 lists ALL endpoints", "hosts: 192.168.122.200:2379,192.168.122.201:2379,192.168.122.202:2379" in patroni_yml)
     check("old single-host etcd3 removed", "host: {{ node_ip }}:2379" not in patroni_yml)
     check("watchdog section present", "watchdog:" in patroni_yml and "/dev/watchdog" in patroni_yml and "safety_margin: 5" in patroni_yml)
+    check("pgpool role-signal callback present INSIDE postgresql (this build reads callbacks from postgresql subsection)",
+          "    callbacks:\n        on_role_change: /usr/local/sbin/pgpool_role_signal.sh" in patroni_yml)
     check("pg_hba still intact", "host replication replicator 0.0.0.0/0 scram-sha-256" in patroni_yml)
     check("archive_command still intact", "pgbackrest --stanza=kyc archive-push" in patroni_yml)
 
@@ -224,6 +226,7 @@ def main():
     pgpool_conf = render_block(blocks["Configure pgpool.conf"])
     check("heartbeat_port0 = 9694 (not wd_port)", "heartbeat_port0 = 9694" in pgpool_conf)
     check("wd_quorum_exit = on", "wd_quorum_exit = on" in pgpool_conf)
+    check("sr_check_period = 3 (switchover detection)", "sr_check_period = 3" in pgpool_conf and "sr_check_period = 10" not in pgpool_conf)
     check("wd_authkey from variable", "wd_authkey = 'test-auth-key'" in pgpool_conf)
     check("watchdog enabled", "use_watchdog = on" in pgpool_conf)
     check("delegate_ip for VIP", "delegate_ip = '192.168.122.200'" in pgpool_conf)

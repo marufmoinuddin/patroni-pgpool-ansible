@@ -1,0 +1,116 @@
+---
+# ============================================================
+# 08 - SWITCHOVER SIGNAL (non-destructive, safe on live cluster)
+# ============================================================
+# Deploys the Patroni on_role_change callback that signals pgpool
+# immediately on promotion, and tightens sr_check_period.
+#
+# This playbook is SAFE to re-run on a live, healthy cluster
+# (unlike 03_Configure_Patroni.yml, which wipes data + etcd keys).
+# It only:
+#   1. copies the callback script
+#   2. adds the callbacks: block to the EXISTING patroni.yml
+#   3. reloads Patroni (callbacks are read from config on reload)
+#   4. sets sr_check_period = 3 in the EXISTING pgpool.conf
+#   5. reloads pgpool
+#
+# The same script + config are also baked into 03 (fresh installs)
+# and 04 (canonical sr_check_period) so clean builds get the fix
+# without running this playbook.
+# ============================================================
+
+- name: Deploy switchover-detection fix (on_role_change callback + sr_check_period)
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    pgpool_conf_dir: "{{ '/etc/pgpool2' if ansible_os_family == 'Debian' else '/etc/pgpool-II' }}"
+    pgpool_service_name: "{{ 'pgpool2' if ansible_os_family == 'Debian' else 'pgpool' }}"
+    callback_script: /usr/local/sbin/pgpool_role_signal.sh
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Deploy the callback script (idempotent copy)
+    # ------------------------------------------------------------
+    - name: Deploy pgpool role-signal callback script
+      ansible.builtin.copy:
+        src: files/pgpool_role_signal.sh
+        dest: "{{ callback_script }}"
+        owner: postgres
+        group: postgres
+        mode: '0755'
+
+    # ------------------------------------------------------------
+    # 2. Add callbacks: block to the EXISTING patroni.yml.
+    #    Patroni (this build) reads callbacks from the postgresql:
+    #    subsection (Postgresql.callback -> ConfigHandler over
+    #    config['postgresql']), NOT from the top level.
+    #
+    #    blockinfile DOES NOT relocate an existing marker block
+    #    (it replaces in place), so this is two steps:
+    #      a) remove any previously-inserted block wherever it sits
+    #      b) insert a 4-space-indented block before the top-level
+    #         tags: line (nests it INSIDE postgresql:)
+    # ------------------------------------------------------------
+    - name: Remove any previously-placed pgpool role-signal callback block
+      ansible.builtin.replace:
+        path: /etc/patroni/patroni.yml
+        regexp: '(?ms)^# BEGIN ANSIBLE MANAGED: pgpool role-signal callback.*?^# END ANSIBLE MANAGED: pgpool role-signal callback\n'
+        replace: ''
+      register: patroni_yml_cleaned
+
+    - name: Ensure on_role_change callback in patroni.yml (postgresql subsection)
+      ansible.builtin.blockinfile:
+        path: /etc/patroni/patroni.yml
+        marker: "# {mark} ANSIBLE MANAGED: pgpool role-signal callback"
+        insertbefore: "^tags:"
+        block: "    callbacks:\n        on_role_change: {{ callback_script }}\n"
+      register: patroni_yml_changed
+
+    # ------------------------------------------------------------
+    # 3. Reload Patroni so the callback takes effect
+    #    (SIGHUP re-reads patroni.yml; callbacks load from config).
+    #    patronictl reload REQUIRES the cluster scope; derive it from
+    #    the deployed patroni.yml so this playbook is self-contained.
+    # ------------------------------------------------------------
+    - name: Read cluster scope from deployed patroni.yml
+      ansible.builtin.shell: grep -E "^scope:" /etc/patroni/patroni.yml | awk "{print \$2}"
+      register: patroni_scope_out
+      changed_when: false
+
+    - name: Reload Patroni to pick up callbacks
+      ansible.builtin.command: patronictl -c /etc/patroni/patroni.yml reload --force "{{ patroni_scope_out.stdout }}"
+      register: patroni_reload
+      changed_when: patroni_reload.rc == 0
+      failed_when: patroni_reload.rc != 0
+
+    # ------------------------------------------------------------
+    # 4. Tighten sr_check_period in the EXISTING pgpool.conf
+    # ------------------------------------------------------------
+    - name: Set sr_check_period = 3 in pgpool.conf
+      ansible.builtin.lineinfile:
+        path: "{{ pgpool_conf_dir }}/pgpool.conf"
+        regexp: '^sr_check_period\s*=\s*\d+'
+        line: 'sr_check_period = 3'
+      register: pgpool_conf_changed
+
+    # ------------------------------------------------------------
+    # 5. Reload pgpool (SIGHUP; sr_check_period is reloadable).
+    #    NOTE: pgpool 4.7 uses positional "reload", NOT "-c reload".
+    #    Deliberately UNCONDITIONAL: if the config file was changed in
+    #    a previous (possibly failed) run, the file-guard would be
+    #    consumed and the running process would stay stale. A reload
+    #    is a cheap SIGHUP - always re-apply it so file and running
+    #    value can never drift.
+    # ------------------------------------------------------------
+    - name: Reload pgpool to apply sr_check_period
+      ansible.builtin.command: pgpool -f {{ pgpool_conf_dir }}/pgpool.conf reload
+      changed_when: true
+
+    - name: Confirm sr_check_period in running pgpool (pool_status)
+      ansible.builtin.command: >
+        grep -E "^sr_check_period" {{ pgpool_conf_dir }}/pgpool.conf
+      register: sr_check_conf
+      changed_when: false
+      failed_when: "'sr_check_period = 3' not in sr_check_conf.stdout"

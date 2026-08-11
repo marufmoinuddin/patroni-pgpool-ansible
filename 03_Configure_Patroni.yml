@@ -473,6 +473,15 @@
                   - basebackup
               basebackup:
                   checkpoint: 'fast'
+              # Active switchover signal: on promotion, immediately tell
+              # pgpool (pcp_promote_node on every pgpool node) instead of
+              # waiting for sr_check polling to notice the role change
+              # (~4 min gap observed 2026-08-11). See files/pgpool_role_signal.sh.
+              # NOTE: Patroni (this build) reads callbacks from the
+              # postgresql: subsection (Postgresql.callback -> ConfigHandler
+              # over config['postgresql']), NOT from the top level.
+              callbacks:
+                  on_role_change: /usr/local/sbin/pgpool_role_signal.sh
 
           tags:
               nofailover: false
@@ -526,6 +535,20 @@
 
           echo "ERROR: etcd not reachable after ${TIMEOUT}s (endpoints: $ENDPOINTS)" >&2
           exit 1
+
+    # ============================================================
+    # SWITCHOVER SIGNAL: Patroni on_role_change callback.
+    # On promotion, immediately tell every pgpool node via
+    # pcp_promote_node - closing the ~4 min clean-switchover
+    # detection gap (see files/pgpool_role_signal.sh).
+    # ============================================================
+    - name: Deploy pgpool role-signal callback script
+      ansible.builtin.copy:
+        src: files/pgpool_role_signal.sh
+        dest: /usr/local/sbin/pgpool_role_signal.sh
+        owner: postgres
+        group: postgres
+        mode: '0755'
 
     # Systemd Setup
     - name: Create Patroni systemd service
