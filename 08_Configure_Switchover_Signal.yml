@@ -45,13 +45,21 @@
     # 2. Add callbacks: block to the EXISTING patroni.yml.
     #    Patroni (this build) reads callbacks from the postgresql:
     #    subsection (Postgresql.callback -> ConfigHandler over
-    #    config['postgresql']), NOT from the top level - so insert
-    #    the block with 4-space indent right before the top-level
-    #    tags: line, which nests it INSIDE postgresql:.
-    #    Custom marker so it never collides with 03's block.
-    #    blockinfile relocates the existing (wrongly placed) block
-    #    on re-run because it keys on the marker.
+    #    config['postgresql']), NOT from the top level.
+    #
+    #    blockinfile DOES NOT relocate an existing marker block
+    #    (it replaces in place), so this is two steps:
+    #      a) remove any previously-inserted block wherever it sits
+    #      b) insert a 4-space-indented block before the top-level
+    #         tags: line (nests it INSIDE postgresql:)
     # ------------------------------------------------------------
+    - name: Remove any previously-placed pgpool role-signal callback block
+      ansible.builtin.replace:
+        path: /etc/patroni/patroni.yml
+        regexp: '(?ms)^# BEGIN ANSIBLE MANAGED: pgpool role-signal callback.*?^# END ANSIBLE MANAGED: pgpool role-signal callback\n'
+        replace: ''
+      register: patroni_yml_cleaned
+
     - name: Ensure on_role_change callback in patroni.yml (postgresql subsection)
       ansible.builtin.blockinfile:
         path: /etc/patroni/patroni.yml
