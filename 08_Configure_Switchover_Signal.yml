@@ -1,0 +1,91 @@
+---
+# ============================================================
+# 08 - SWITCHOVER SIGNAL (non-destructive, safe on live cluster)
+# ============================================================
+# Deploys the Patroni on_role_change callback that signals pgpool
+# immediately on promotion, and tightens sr_check_period.
+#
+# This playbook is SAFE to re-run on a live, healthy cluster
+# (unlike 03_Configure_Patroni.yml, which wipes data + etcd keys).
+# It only:
+#   1. copies the callback script
+#   2. adds the callbacks: block to the EXISTING patroni.yml
+#   3. reloads Patroni (callbacks are read from config on reload)
+#   4. sets sr_check_period = 3 in the EXISTING pgpool.conf
+#   5. reloads pgpool
+#
+# The same script + config are also baked into 03 (fresh installs)
+# and 04 (canonical sr_check_period) so clean builds get the fix
+# without running this playbook.
+# ============================================================
+
+- name: Deploy switchover-detection fix (on_role_change callback + sr_check_period)
+  hosts: pg_nodes
+  become: true
+  gather_facts: true
+
+  vars:
+    pgpool_conf_dir: "{{ '/etc/pgpool2' if ansible_os_family == 'Debian' else '/etc/pgpool-II' }}"
+    pgpool_service_name: "{{ 'pgpool2' if ansible_os_family == 'Debian' else 'pgpool' }}"
+    callback_script: /usr/local/sbin/pgpool_role_signal.sh
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. Deploy the callback script (idempotent copy)
+    # ------------------------------------------------------------
+    - name: Deploy pgpool role-signal callback script
+      ansible.builtin.copy:
+        src: files/pgpool_role_signal.sh
+        dest: "{{ callback_script }}"
+        owner: postgres
+        group: postgres
+        mode: '0755'
+
+    # ------------------------------------------------------------
+    # 2. Add callbacks: block to the EXISTING patroni.yml
+    #    (custom marker so it never collides with 03's block)
+    # ------------------------------------------------------------
+    - name: Ensure on_role_change callback in patroni.yml
+      ansible.builtin.blockinfile:
+        path: /etc/patroni/patroni.yml
+        marker: "# {mark} ANSIBLE MANAGED: pgpool role-signal callback"
+        insertbefore: "^bootstrap:"
+        block: |
+          callbacks:
+              on_role_change: {{ callback_script }}
+      register: patroni_yml_changed
+
+    # ------------------------------------------------------------
+    # 3. Reload Patroni so the callback takes effect
+    #    (SIGHUP re-reads patroni.yml; callbacks load from config)
+    # ------------------------------------------------------------
+    - name: Reload Patroni to pick up callbacks
+      ansible.builtin.command: patronictl -c /etc/patroni/patroni.yml reload
+      register: patroni_reload
+      changed_when: "'No scheduled restart' in patroni_reload.stdout or patroni_reload.rc == 0"
+      failed_when: patroni_reload.rc != 0
+
+    # ------------------------------------------------------------
+    # 4. Tighten sr_check_period in the EXISTING pgpool.conf
+    # ------------------------------------------------------------
+    - name: Set sr_check_period = 3 in pgpool.conf
+      ansible.builtin.lineinfile:
+        path: "{{ pgpool_conf_dir }}/pgpool.conf"
+        regexp: '^sr_check_period\s*=\s*\d+'
+        line: 'sr_check_period = 3'
+      register: pgpool_conf_changed
+
+    # ------------------------------------------------------------
+    # 5. Reload pgpool (SIGHUP; sr_check_period is reloadable)
+    # ------------------------------------------------------------
+    - name: Reload pgpool to apply sr_check_period
+      ansible.builtin.command: pgpool -c reload
+      when: pgpool_conf_changed.changed
+      changed_when: true
+
+    - name: Confirm sr_check_period in running pgpool (pool_status)
+      ansible.builtin.command: >
+        grep -E "^sr_check_period" {{ pgpool_conf_dir }}/pgpool.conf
+      register: sr_check_conf
+      changed_when: false
+      failed_when: "'sr_check_period = 3' not in sr_check_conf.stdout"

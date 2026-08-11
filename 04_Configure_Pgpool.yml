@@ -351,8 +351,14 @@
           # Streaming replication check (REQUIRED: find_primary_node uses
           # sr_check_user/password to detect the primary; unset values cause
           # "no PostgreSQL user name specified in startup packet" and the
-          # pool rejects all client connections)
-          sr_check_period = 10
+          # pool rejects all client connections).
+          # sr_check_period lowered 10->3 (2026-08-12): on a clean Patroni
+          # switchover pgpool has no active signal (failover_command only
+          # fires on backend-down), so primary re-detection is polling-bound.
+          # The Patroni on_role_change callback (03) now closes most of that
+          # gap; 3s bounds the residual window. Overhead: 1 trivial query /
+          # backend / 3s - negligible.
+          sr_check_period = 3
           sr_check_user = '{{ health_check_user }}'
           sr_check_password = '{{ health_check_password }}'
           sr_check_database = 'postgres'
