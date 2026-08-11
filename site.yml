@@ -7,5 +7,9 @@
 - import_playbook: 03_Configure_Patroni.yml
 - import_playbook: 04_Configure_Pgpool.yml
 - import_playbook: 05_Configure_Pgbackrest.yml
-- import_playbook: 06_Install_Pmm_Monitoring.yml
+# PMM is DISABLED BY POLICY (2026-08-11): Docker/PMM alongside
+# ClickHouse/Grafana/VictoriaMetrics saturated br1 (2 vCPU) and wedged its
+# sshd path (Test 2 root cause). Do NOT re-enable without an explicit
+# decision + br1 resize / metrics-stack split. See README §12.8.
+#- import_playbook: 06_Install_Pmm_Monitoring.yml
 - import_playbook: 07_Configure_Cluster_Health.yml

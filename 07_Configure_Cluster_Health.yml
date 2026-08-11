@@ -164,6 +164,23 @@
 
           log() { echo "$NOW $*" >> "$LOG"; }
 
+          # --- durable leader-election / false-positive event logging -----------
+          # Append-only event stream + persistent counters for the multi-week
+          # soak. State file survives across runs; counters are monotonic and
+          # exposed as Prometheus textfile metrics (Test 4 instrumentation).
+          EVENT_LOG="/var/log/patroni/leader_events.log"
+          STATE_FILE="/var/log/patroni/cluster_health.state"
+
+          PREV_LEADER=""; PREV_WRITABLE=1; PREV_QUORUM=1
+          LEADER_CHANGES_TOTAL=0; READ_ONLY_EVENTS_TOTAL=0
+          LEADER_LOST_TOTAL=0; ETCD_QUORUM_LOSS_TOTAL=0
+          if [ -f "$STATE_FILE" ]; then
+            # shellcheck disable=SC1090
+            . "$STATE_FILE"
+          fi
+
+          event() { echo "$(date -Is) $*" >> "$EVENT_LOG"; }
+
           # --- etcd -------------------------------------------------------------
           ETCD_HEALTHY=0; ETCD_QUORUM=0; ETCD_UP=0; ETCD_TOTAL=0
           for ep in $(echo "$ETCD_ENDPOINTS" | tr ',' ' '); do
@@ -200,13 +217,66 @@
             LEADER_HOST=$(echo "$LIST" | jq -r '[.[] | select(.Role == "Leader")][0].Host // ""' 2>/dev/null)
             if [ -n "$LEADER_HOST" ] && [ "$LEADER_HOST" != "null" ]; then
               LEADER_ROLE=$(curl -s -m 5 "http://${LEADER_HOST}:8008/patroni" 2>/dev/null | jq -r '.role // "unknown"' 2>/dev/null)
-              if [ -n "$LEADER_ROLE" ] && [ "$LEADER_ROLE" != "primary" ]; then
+              # Probe timeout/empty stdin makes the curl|jq pipeline yield "" even
+              # though the DCS Leader is present. Treat empty as "unknown" so a
+              # hung REST API (Test 2's archive-get hang) is NEVER reported
+              # healthy -- not writable is safer than silently writable.
+              [ -z "$LEADER_ROLE" ] && LEADER_ROLE="unknown"
+              if [ "$LEADER_ROLE" != "primary" ]; then
                 LEADER_WRITABLE=0
                 CRITICAL=1
                 log "CRITICAL leader $LEADER_MEMBER ($LEADER_HOST) is NOT writable (REST role=$LEADER_ROLE, pg_is_in_recovery=true) - DCS leader but read-only"
               fi
             fi
           fi
+
+          # --- durable event detection (leader changes / elections / false positives) ---
+          # Compares current state against the persisted previous run and emits
+          # one event line per transition. Counters are monotonic and stored
+          # back to STATE_FILE so they survive restarts.
+          if [ "$LEADER_PRESENT" -eq 1 ]; then
+            if [ -z "$PREV_LEADER" ]; then
+              event "leader_elected member=$LEADER_MEMBER writable=$LEADER_WRITABLE"
+              LEADER_CHANGES_TOTAL=$((LEADER_CHANGES_TOTAL + 1))
+            elif [ "$PREV_LEADER" != "$LEADER_MEMBER" ]; then
+              event "leader_changed from=$PREV_LEADER to=$LEADER_MEMBER writable=$LEADER_WRITABLE"
+              LEADER_CHANGES_TOTAL=$((LEADER_CHANGES_TOTAL + 1))
+            fi
+            # False positive: DCS reports a Leader but it is NOT writable.
+            if [ "$LEADER_WRITABLE" -eq 0 ] && [ "$PREV_WRITABLE" -ne 0 ]; then
+              event "false_positive leader=$LEADER_MEMBER not_writable role=$LEADER_ROLE"
+              READ_ONLY_EVENTS_TOTAL=$((READ_ONLY_EVENTS_TOTAL + 1))
+            fi
+            # Recovery from a false positive (writable restored)
+            if [ "$LEADER_WRITABLE" -eq 1 ] && [ "$PREV_WRITABLE" -eq 0 ]; then
+              event "leader_writable_restored member=$LEADER_MEMBER"
+            fi
+          else
+            if [ -n "$PREV_LEADER" ]; then
+              event "leader_lost previous=$PREV_LEADER"
+              LEADER_LOST_TOTAL=$((LEADER_LOST_TOTAL + 1))
+            fi
+          fi
+
+          # etcd quorum loss / recovery transitions
+          if [ "$ETCD_QUORUM" -ne 1 ] && [ "$PREV_QUORUM" -eq 1 ]; then
+            event "etcd_quorum_lost up=$ETCD_UP total=$ETCD_TOTAL"
+            ETCD_QUORUM_LOSS_TOTAL=$((ETCD_QUORUM_LOSS_TOTAL + 1))
+          fi
+          if [ "$ETCD_QUORUM" -eq 1 ] && [ "$PREV_QUORUM" -ne 1 ]; then
+            event "etcd_quorum_restored up=$ETCD_UP total=$ETCD_TOTAL"
+          fi
+
+          # Persist state for next run
+          cat > "$STATE_FILE" <<EOF
+          PREV_LEADER="$LEADER_MEMBER"
+          PREV_WRITABLE=$LEADER_WRITABLE
+          PREV_QUORUM=$ETCD_QUORUM
+          LEADER_CHANGES_TOTAL=$LEADER_CHANGES_TOTAL
+          READ_ONLY_EVENTS_TOTAL=$READ_ONLY_EVENTS_TOTAL
+          LEADER_LOST_TOTAL=$LEADER_LOST_TOTAL
+          ETCD_QUORUM_LOSS_TOTAL=$ETCD_QUORUM_LOSS_TOTAL
+          EOF
 
           # --- pgpool watchdog + backends ----------------------------------------
           WD_QUORUM=0
@@ -257,6 +327,10 @@
           pgpool_backends_total $BACKENDS_TOTAL
           pgpool_backends_up $BACKENDS_UP
           vip_present $VIP_PRESENT
+          patroni_leader_changes_total $LEADER_CHANGES_TOTAL
+          patroni_leader_read_only_events_total $READ_ONLY_EVENTS_TOTAL
+          patroni_leader_lost_events_total $LEADER_LOST_TOTAL
+          patroni_etcd_quorum_loss_total $ETCD_QUORUM_LOSS_TOTAL
           "
           for dir in $TEXTFILE_DIRS; do
             [ -z "$dir" ] && continue

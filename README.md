@@ -1713,6 +1713,15 @@ Metrics exposed (scraped by PMM's node_exporter textfile collector):
 `patroni_members_nonrunning`, `etcd_healthy`, `etcd_quorum`,
 `pgpool_wd_quorum`, `pgpool_backends_total/up`, `vip_present`.
 
+Durable event log (Test 4 instrumentation): every leader election/change,
+leader-lost, DCS-leader-but-read-only false positive, writability-restored,
+and etcd quorum loss/restore is appended to
+`/var/log/patroni/leader_events.log` (ISO-8601 timestamps) and counted in
+monotonic Prometheus counters `patroni_leader_changes_total`,
+`patroni_leader_read_only_events_total`, `patroni_leader_lost_events_total`,
+`patroni_etcd_quorum_loss_total` — so a long soak produces a reviewable,
+queryable record of every transition instead of a flat log you have to grep.
+
 Set `health_alert_command` (e.g. a webhook curl) in `variables.yaml` to get
 paged *before* an outage becomes permanent.
 
@@ -1724,6 +1733,45 @@ with `initial-cluster-state: existing`), then Patroni on one node, then the
 rest — or restore from pgBackRest if data is unrecoverable. The fixes above
 buy you: **losing any single host** (or two, with 5-node etcd) with **no total
 outage**.
+
+### 12.7 Named Architectural Finding: DCS is a Single Point of Failure for Write Availability
+
+> **Finding (confirmed by Test 3 — mixed/cascading failure, 2026-08-11):**
+> **etcd is a single point of failure for *write availability* in this
+> architecture.** During Test 3, two of three PostgreSQL nodes were fully
+> healthy throughout, and yet **all writes stopped completely** because the
+> etcd cluster lost quorum (one member killed + 30% packet loss between the
+> two survivors made a 2-of-3 quorum unreachable). The cluster correctly
+> chose **safe-unavailable** (zero primaries, read-only, no split-brain, no
+> data loss — 53/53 confirmed writes survived), but the outcome stands: a
+> healthy database cannot accept writes without a healthy DCS.
+>
+> **Implication:** DCS availability is the upper bound on write availability.
+> Any failure that degrades etcd quorum — even while every Postgres node is
+> healthy — takes the entire cluster read-only.
+>
+> **Proposed mitigation (cross-ref §12.1):** decouple the DCS failure domain
+> from the database failure domain so a DB-host problem cannot take quorum
+> down with it. Concrete options, in increasing order of cost:
+> 1. **Dedicated etcd witness nodes** (`etcd_group: "etcd_nodes"`) — etcd no
+>    longer co-locates with Postgres, so a DB host crash never touches quorum
+>    (§12.1).
+> 2. **5-node etcd topology** — tolerates two concurrent etcd losses,
+>    end-to-end, instead of one.
+> 3. Combination of the above (dedicated witnesses *and* 5 members) for the
+>    strongest separation.
+>
+> This is an architectural recommendation for a follow-up decision — **not a
+> blocker** for the current single-host-loss HA guarantees, which are
+> unaffected.
+
+### 12.8 Known Non-Blockers (follow-up, not required for HA acceptance)
+
+| Item | Status | Action |
+|------|--------|--------|
+| br1 under-provisioned (2 vCPU running ClickHouse + Docker + Grafana + VictoriaMetrics + PMM; thrashes to loadavg 60+; caused the Test 2 sshd wedge) | Open — not a blocker | Resize br1 or split the metrics stack (e.g. PMM server on its own host) |
+| pgbackrest **archive-push** path can silently wedge for hours with no monitoring alert (observed ~2.5h before Test 2) | Open — not a blocker | Add an archive-staleness/backlog check (oldest unarchived WAL age) to the health monitor |
+| PMM monitoring | **Disabled by policy** | PMM stays off on br1; do not redeploy; skip PMM checks in test reports |
 
 ---
 
