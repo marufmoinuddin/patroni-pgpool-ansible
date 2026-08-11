@@ -14,6 +14,14 @@
 #
 # Env: PGPASSFILE or PGPASSWORD must provide pgpool_admin credentials.
 #      Connect string is hardcoded to the cluster VIP.
+#
+# SEEDING (fixed in Iteration 3+): the starting ID is ALWAYS derived from a
+# fresh atomic query SELECT COALESCE(max(id),0) FROM txn_track executed
+# immediately before the loop starts — never from a remembered/manual value
+# or a stale .ids file. On a duplicate-key error (stale state or concurrent
+# writer), the same ID is retried at most 3 times, then the workload
+# re-queries max(id) and RESUMES from there (RESYNC); it never wedges on one
+# colliding ID.
 # ============================================================================
 set -euo pipefail
 
@@ -42,19 +50,35 @@ mkdir -p "$ARTIFACT_DIR"
 LOG="$ARTIFACT_DIR/txn_${CLIENT}.ids"
 STATE="$ARTIFACT_DIR/txn_${CLIENT}.state"
 EVENTS="$ARTIFACT_DIR/txn_${CLIENT}.events"
-touch "$LOG" "$EVENTS"
+LOG_FILE="$ARTIFACT_DIR/txn_${CLIENT}.log"
+: > "$EVENTS"
+: > "$LOG"
+touch "$STATE" "$LOG_FILE"
 
-# Recover last confirmed id if resuming (allows restart mid-test)
-LAST_ID=0
-if [ -s "$LOG" ]; then
-    LAST_ID=$(tail -1 "$LOG")
+MAX_QUERY="SELECT COALESCE(max(id), 0) FROM txn_track;"
+
+# --- Fresh atomic seed: ALWAYS query the table. Never trust the filesystem. ---
+LAST_ID=""
+for attempt in 1 2 3 4 5; do
+    LAST_ID=$("$PSQL" -h "$VIP" -p "$PORT" -U "$USER" -d "$DB" -tA -c "$MAX_QUERY" 2>/dev/null | head -1) || true
+    if [ -n "$LAST_ID" ] && [ "$LAST_ID" -ge 0 ] 2>/dev/null; then
+        break
+    fi
+    echo "$(date -u +%FT%TZ) WARN seed max(id) query failed (attempt $attempt), retrying..." | tee -a "$LOG_FILE"
+    sleep 2
+done
+if [ -z "$LAST_ID" ]; then
+    echo "$(date -u +%FT%TZ) FATAL could not query table max(id) — is the VIP/pgpool up?" | tee -a "$LOG_FILE"
+    exit 2
 fi
 
-echo "=== txn_workload $CLIENT start at $(date -u +%FT%TZ) from id=$LAST_ID dur=${DURATION}s ===" | tee -a "$ARTIFACT_DIR/txn_${CLIENT}.log"
+echo "=== txn_workload $CLIENT start at $(date -u +%FT%TZ) seeded=max(id)=$LAST_ID (fresh query) dur=${DURATION}s ===" | tee -a "$LOG_FILE"
 
 START=$(date +%s)
 CONFIRMED=0
 FAILED=0
+RESYNC=0
+SAME_ID_RETRIES=0
 NEXT_ID=$((LAST_ID + 1))
 
 while [ $(( $(date +%s) - START )) -lt "$DURATION" ]; do
@@ -64,15 +88,25 @@ while [ $(( $(date +%s) - START )) -lt "$DURATION" ]; do
     OUT=$("$PSQL" -h "$VIP" -p "$PORT" -U "$USER" -d "$DB" \
           -v ON_ERROR_STOP=1 -tA \
           -c "INSERT INTO txn_track(id, client, ts) VALUES ($ID, '$CLIENT', now()) RETURNING id;" 2>&1) \
-        && { echo "$ID" >> "$LOG"; echo "$(date -u +%FT%TZ) CONFIRMED $ID" >> "$EVENTS"; CONFIRMED=$((CONFIRMED + 1)); NEXT_ID=$((NEXT_ID + 1)); } \
-        || { echo "$(date -u +%FT%TZ) FAILED $ID: $(echo "$OUT" | head -1)" >> "$EVENTS"; echo "FAILED id=$ID: $(echo "$OUT" | head -1)" >> "$ARTIFACT_DIR/txn_${CLIENT}.log"; FAILED=$((FAILED + 1)); }
+        && { echo "$ID" >> "$LOG"; echo "$(date -u +%FT%TZ) CONFIRMED $ID" >> "$EVENTS"; CONFIRMED=$((CONFIRMED + 1)); NEXT_ID=$((NEXT_ID + 1)); SAME_ID_RETRIES=0; } \
+        || { echo "$(date -u +%FT%TZ) FAILED $ID: $(echo "$OUT" | head -1)" >> "$EVENTS"; echo "FAILED id=$ID: $(echo "$OUT" | head -1)" >> "$LOG_FILE"; FAILED=$((FAILED + 1)); \
+             if echo "$OUT" | grep -qi "duplicate key"; then \
+                 SAME_ID_RETRIES=$((SAME_ID_RETRIES + 1)); \
+                 if [ "$SAME_ID_RETRIES" -ge 3 ]; then \
+                     NEW_MAX=$("$PSQL" -h "$VIP" -p "$PORT" -U "$USER" -d "$DB" -tA -c "$MAX_QUERY" 2>/dev/null | head -1) || true; \
+                     if [ -n "$NEW_MAX" ] && [ "$NEW_MAX" -ge "$ID" ] 2>/dev/null; then \
+                         NEXT_ID=$((NEW_MAX + 1)); SAME_ID_RETRIES=0; RESYNC=$((RESYNC + 1)); \
+                         echo "$(date -u +%FT%TZ) RESYNC colliding-id=$ID -> next=$NEXT_ID (table max=$NEW_MAX)" >> "$EVENTS"; \
+                         echo "RESYNC colliding-id=$ID -> next=$NEXT_ID (table max=$NEW_MAX)" >> "$LOG_FILE"; \
+                     fi; \
+                 fi; \
+             fi; }
 
-    # Small pacing gap: keeps connection churn bounded; adjust if load needs
-    # to be higher. 0.02s ~ 50 txn/s per client.
+    # Small pacing gap: keeps connection churn bounded. 0.02s ~ 50 txn/s.
     sleep 0.02
 done
 
 echo "LAST_ID=$((NEXT_ID - 1))" > "$STATE"
-echo "CONFIRMED=$CONFIRMED FAILED=$FAILED" >> "$STATE"
-echo "=== txn_workload $CLIENT done: confirmed=$CONFIRMED failed=$FAILED last=$(tail -1 "$LOG") ===" | tee -a "$ARTIFACT_DIR/txn_${CLIENT}.log"
+echo "CONFIRMED=$CONFIRMED FAILED=$FAILED RESYNC=$RESYNC" >> "$STATE"
+echo "=== txn_workload $CLIENT done: confirmed=$CONFIRMED failed=$FAILED resync=$RESYNC last=$(tail -1 "$LOG") ===" | tee -a "$LOG_FILE"
 exit 0
