@@ -64,15 +64,63 @@ ip addr show eth0 | grep 192.168.122.200   # run on other nodes
 # 4. Applications keep connecting to the SAME VIP — nothing changed for them
 ```
 
-## Test 4 — Planned Switchover (Zero Downtime)
+## Test 4 — Planned Switchover (NOT zero-downtime — detection gap)
+
+> ⚠️ **Correction (2026-08-12):** this test was previously labeled
+> "Zero Downtime". That is **not true today**. A clean `patronictl switchover`
+> does not signal pgpool: `failover_command` only fires when a backend goes
+> *down*, and a graceful switchover demotes/promotes without any backend
+> outage. pgpool therefore relies on its periodic `sr_check`/health-check
+> polling to notice the role change, and writes through the VIP fail with
+> `cannot execute CREATE TABLE in a read-only transaction` until it catches up.
 
 ```bash
-# Move leadership from db1 to db2, gracefully
+# Move leadership gracefully, e.g. db2 → db1
 patronictl -c /etc/patroni/patroni.yml switchover
 
-# Patroni: demotes db1 → promotes db2 → db1 becomes a replica
+# Patroni: demotes old leader → promotes new leader → old leader becomes a replica
 patronictl -c /etc/patroni/patroni.yml list
+
+# Watch pgpool's view catch up — expect a write blip in between
+# (run this loop until node0/db1 shows "primary primary"):
+PCPPASSFILE=/etc/pgpool-II/.pcppass pcp_node_info -h 192.168.122.200 -p 9898 -U pgpool_pcp -w 0
 ```
+
+**Observed behavior (2026-08-11 manual run, three rapid switchovers in 5 min):**
+the write blip was **~4 minutes** — switchover completed 15:29:05, pgpool still
+routed writes to the old primary at 15:32:55 (VIP writes failed
+`read-only transaction`), and re-detected the new primary by ~15:33:22. The
+three back-to-back switchovers compounded the lag; a single clean switchover
+should be quicker, but the gap is real and must not be sold as zero-downtime.
+
+**Why:** pgpool has no active signal on a clean Patroni role change. `sr_check`
+polling (now `sr_check_period = 3` after the fix; was 10 at the time of the
+observation) is the polling-only mechanism that updates the primary role, so
+a pure-polling design is bounded by polling cadence plus detection time.
+
+**Fix (implemented 2026-08-12, PR #6 — `fix/switchover-detection`):**
+a Patroni `on_role_change` callback (`/usr/local/sbin/pgpool_role_signal.sh`,
+deployed by `08_Configure_Switchover_Signal.yml`) that, on promotion, confirms
+via `patronictl` that this node is the Patroni Leader and immediately runs
+`pcp_promote_node` for its backend id on **all** pgpool nodes (including the
+VIP-holding watchdog leader). Plus `sr_check_period` tightened 10 → 3 as a
+polling safety net. Callbacks must live **inside the `postgresql:` section**
+of `patroni.yml` in this build (top-level `callbacks:` is invisible to
+`Postgresql.callback` — the original placement failed the retest).
+
+**Measured retest (2026-08-12, one clean switchover db2 → db1, VIP workload +
+3-node observer):** write blip **~3–4 seconds** (first failure 20:48:18Z,
+writes resumed 20:48:21Z; 28 failed attempts in the window, all retryable
+read-only/connection errors, **0 lost commits** — 999/999 confirmed IDs
+present on the new primary). The callback fired at 20:48:19Z and pgpool's
+`pool_nodes` flipped to `0=up/up/primary` in the same second. No split-brain
+samples (never two `recovery=f` at once). Previously: ~4 minutes.
+
+**Honest bar:** still not literal zero, and it should not be sold as such —
+an async, connection-pooled architecture always has *some* window between
+the old primary demoting and pgpool routing to the new one. Single-digit
+seconds is the legitimate target and the fix meets it. The residual window
+is the connection teardown/retry latency of in-flight client connections.
 
 ## Test 5 — Automated Kill/Recovery Validation (recommended)
 
