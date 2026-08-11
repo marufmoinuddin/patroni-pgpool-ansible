@@ -66,8 +66,8 @@
         marker: "# {mark} ANSIBLE MANAGED: pgpool role-signal callback"
         insertbefore: "^tags:"
         block: |
-            callbacks:
-                on_role_change: {{ callback_script }}
+                callbacks:
+                    on_role_change: {{ callback_script }}
       register: patroni_yml_changed
 
     # ------------------------------------------------------------
