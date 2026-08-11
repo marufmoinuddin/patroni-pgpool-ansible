@@ -67,7 +67,7 @@
       changed_when: false
 
     - name: Reload Patroni to pick up callbacks
-      ansible.builtin.command: patronictl -c /etc/patroni/patroni.yml reload "{{ patroni_scope_out.stdout }}"
+      ansible.builtin.command: patronictl -c /etc/patroni/patroni.yml reload --force "{{ patroni_scope_out.stdout }}"
       register: patroni_reload
       changed_when: patroni_reload.rc == 0
       failed_when: patroni_reload.rc != 0
