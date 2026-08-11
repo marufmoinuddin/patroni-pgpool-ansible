@@ -28,7 +28,7 @@ You can deploy everything **automatically with Ansible** (recommended), or **ste
 8. [Deployment Method A — Ansible (Automated)](#8-deployment-method-a--ansible-automated)
 9. [Deployment Method B — Manual (No Ansible)](#9-deployment-method-b--manual-no-ansible)
 10. [Operations Guide — Daily Commands](#10-operations-guide--daily-commands)
-11. [Failure Testing — Learning by Breaking Things](#11-failure-testing--learning-by-breaking-things)
+11. [Deployment Result — Validated](#11-deployment-result--validated)
 12. [Resilience & Self-Healing](#12-resilience--self-healing)
 13. [Troubleshooting Common Issues](#13-troubleshooting-common-issues)
 14. [Security Notes — Change These Before Production](#14-security-notes--change-these-before-production)
@@ -1599,113 +1599,54 @@ sudo -iu postgres pgbackrest --stanza=kyc --type=time \
 
 ---
 
-## 11. Failure Testing — Learning by Breaking Things
+## 11. Deployment Result — Validated
 
-> 🧪 Do this in a test environment first. It is the only way to trust your HA cluster.
+This architecture has been **deployed end-to-end and validated on real hardware
+(kernel-level VMs), not just designed**. The automated failover harness in
+[`tests/`](tests/) was used to power-loss kill the cluster's leader five times
+in a row (`virsh destroy` — no graceful stops), observe every failover, and
+verify the recovery. The complete evidence — per-iteration timelines,
+durability tables, split-brain sample counts — lives in the
+**[Step 6 Failover Validation Report](docs/step6_failover_report.md)**; the
+exact procedures to reproduce the run are in
+**[Failure Testing](docs/FAILOVER_TESTING.md)**.
 
-### Test 1 — Kill the Primary (Automatic Failover)
+**Validated headline facts:**
 
-```bash
-# 1. From any node, note the current leader
-patronictl -c /etc/patroni/patroni.yml list
+- ✅ **5 / 5 consecutive power-loss failover iterations passed** (kills
+  rotated across all three nodes: db1 → db3 → db1 → db3 → db2)
+- ✅ **Zero lost commits** across ~104,000 confirmed writes (seed-line
+  `comm -23` vs the actual table, every run)
+- ✅ **Zero split-brain** across **3,600 direct node probes** (720 samples × 5
+  iterations; ≤1 node primary at all times)
+- ✅ **~40s median failover** (38–43s from power loss to first successful write
+  on the new primary), write interruption 34–38s
+- ✅ **Killed-node rejoin 36–40s** — far inside the ≤10-minute budget, via
+  Patroni's normal re-bootstrap (`pg_rewind` + WAL catch-up); no Ansible
+  re-provisioning, no manual intervention
+- ✅ **Single-node failure tolerance confirmed** — the cluster survives losing
+  *any one* host (database node *or* etcd quorum member). It does **not**
+  survive losing two hosts at once; that requires the 3–5 witness etcd
+  topology (see [§12](#12-resilience--self-healing)).
 
-# 2. SSH to the leader and kill PostgreSQL HARD (simulates a crash)
-#    (on the leader node)
-systemctl kill -s SIGKILL patroni
-#    or even better — power it off:  poweroff
+> ⚠️ **Honest caveat — async replication.** Replication is asynchronous
+> (`synchronous_standby_names` not set). A transaction committed on the old
+> primary moments before a power loss can, in the worst case, be absent from
+> the promoted replica. Zero lost commits were observed across all five runs,
+> but that is empirical evidence, not a design guarantee: for zero-RPO the
+> stack must be switched to synchronous replication. The 34–38s write
+> interruption is the client-visible failover window (pgpool health-polling +
+> Patroni election + attach cycle) — not zero downtime; stateful clients must
+> retry.
 
-# 3. Wait ~40 seconds (TTL 30s + loop_wait 10s)
-# 4. Check the cluster — a replica should now be Leader
-patronictl -c /etc/patroni/patroni.yml list
+Full methodology and raw evidence:
 
-# 5. Check pgpool followed
-pcp_watchdog_info -h localhost -p 9898 -U pgpool_pcp -w
+| Document | Purpose |
+|----------|---------|
+| [`docs/FAILOVER_TESTING.md`](docs/FAILOVER_TESTING.md) | How to run the tests: manual Tests 1–4 + automated harness (Test 5) |
+| [`docs/step6_failover_report.md`](docs/step6_failover_report.md) | What actually happened: 5/5 PASS, timelines, durability, split-brain, limitations |
 
-# 6. Reconnect the app — it should still work via the VIP with no code change
-psql -h 192.168.122.200 -p 9999 -U postgres -d postgres -c "SELECT now();"
-```
-
-**Expected result:** writes fail for ~40 seconds, then resume on the new primary. The VIP keeps serving. **No manual intervention.**
-
-### Test 2 — Kill a Replica
-
-```bash
-# Stop Patroni on a replica (simulate a node failing)
-systemctl stop patroni        # on db3, for example
-
-# The cluster should stay green — Patroni marks db3 as unavailable
-patronictl -c /etc/patroni/patroni.yml list
-
-# Restart it — Patroni brings it back as a streaming replica automatically
-systemctl start patroni       # on db3
-patronictl -c /etc/patroni/patroni.yml list
-```
-
-### Test 3 — Kill the pgpool Watchdog Leader
-
-```bash
-# 1. Find which pgpool node owns the VIP
-pcp_watchdog_info -h localhost -p 9898 -U pgpool_pcp -w
-
-# 2. Stop pgpool on that node
-systemctl stop pgpool         # on the watchdog leader
-
-# 3. Within seconds, another node takes over the VIP
-ip addr show eth0 | grep 192.168.122.200   # run on other nodes
-
-# 4. Applications keep connecting to the SAME VIP — nothing changed for them
-```
-
-### Test 4 — Planned Switchover (Zero Downtime)
-
-```bash
-# Move leadership from db1 to db2, gracefully
-patronictl -c /etc/patroni/patroni.yml switchover
-
-# Patroni: demotes db1 → promotes db2 → db1 becomes a replica
-patronictl -c /etc/patroni/patroni.yml list
-```
-
-### Test 5 — Automated Kill/Recovery Validation (recommended)
-
-The repository ships an automated failover test harness for reproducible
-kill → observe → recover → verify cycles. See
-[`docs/step6_failover_report.md`](docs/step6_failover_report.md) for a full
-5-iteration validation run with zero lost commits and zero split-brain.
-
-```bash
-# From your workstation (NOT the db nodes), in the repo checkout:
-bash tests/failover_test_harness.sh --targets db1 --action vm-destroy --allow-leader   # dry-run first
-bash tests/failover_test_harness.sh --targets db1 --action vm-destroy --allow-leader --execute   # power-loss kill
-
-# Meanwhile, on the hypervisor/VPS:
-bash tests/step4_observer.sh ~/deploy/artifacts/run1_iter1 720 2 192.168.122.152   # split-brain observer
-
-# On a surviving node, keep a write workload running THROUGH outage + recovery:
-bash tests/txn_workload.sh run1_iter1 2400 /var/lib/pgpool-artifacts/run1_iter1
-
-# After the kill: recover the node, wait for rejoin, then verify durability
-bash tests/failover_test_harness.sh --targets db1 --action vm-start --execute
-#   comm -23 confirmed.ids table.ids  → must be EMPTY (zero lost commits)
-```
-
-**Lessons baked into the harness (do not regress these):**
-
-1. **The workload window must cover the whole recovery** (`2400` seconds = 40 min).
-   A short window (e.g. 480s) lets WAL production go idle mid-recovery; the
-   rewound former primary then stalls on segment closure and can take 40+ min
-   to rejoin. With continuous writes, rejoin is 36–40s.
-2. **The workload always seeds from a fresh atomic `SELECT COALESCE(max(id),0)`**
-   at startup — never from a remembered/`tail`-tracked value — and on a
-   duplicate-key error it retries the colliding ID at most 3 times, then
-   auto-resyncs. The old stale-seed path wedged in hundreds of failed retries.
-3. **The observer samples `pg_is_in_recovery()` directly on all 3 nodes**
-   (not just pool state) every ~2s for 720 samples, which is what proves
-   "≤1 primary at all times" — the definitive split-brain check.
-4. `vm-destroy` (virsh power loss) is the correct kill primitive; graceful
-   stops are not a valid substitute for failover testing.
-
----
+|---
 
 ## 12. Resilience & Self-Healing
 
@@ -1849,7 +1790,7 @@ outage**.
    # cron on the backup node
    0 1 * * * sudo -iu postgres pgbackrest --stanza=kyc --type=incr backup
    ```
-7. **Test failover monthly** — run [Section 11](#11-failure-testing--learning-by-breaking-things) on a schedule. A HA cluster you never test is a false promise.
+7. **Test failover monthly** — run the procedures in [docs/FAILOVER_TESTING.md](docs/FAILOVER_TESTING.md) on a schedule. A HA cluster you never test is a false promise.
 8. **Monitor the monitors** — PMM alerting should include: Patroni node down, etcd quorum lost, replica lag, backup age, VIP owner changes.
 9. **Keep the deployment reproducible** — the whole point of this repo: one `ansible-playbook` run rebuilds the world. Store your customized `hosts` + vars in Git (secrets in Vault).
 10. **Backup the etcd data too** — etcd holds the cluster brain (`/percona_lab/kyc/*`). A full backup strategy includes `etcdctl snapshot save`.

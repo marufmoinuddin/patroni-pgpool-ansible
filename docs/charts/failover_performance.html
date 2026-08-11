@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Failover Performance — Step 6 Validation (G2 v5)</title>
+<script src="https://unpkg.com/@antv/g2@5/dist/g2.min.js"></script>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 24px; color: #1f2328; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  p.sub { color: #57606a; font-size: 14px; margin-top: 0; }
+  #container { width: 100%; height: 420px; }
+  p.note { color: #57606a; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>Failover performance — power-loss kills, 5 consecutive iterations</h1>
+<p class="sub">Failover T0→T4 (kill → first successful write) vs client-visible write interruption, per iteration</p>
+<div id="container"></div>
+<p class="note">Source: docs/step6_failover_report.md §3. Failover median 40s (38–43s); write interruption 34–38s. Each kill = virsh destroy via failover_test_harness.sh.</p>
+<script>
+  const chart = new G2.Chart({ container: 'container', autoFit: true });
+
+  chart.options({
+    type: 'interval',
+    data: [
+      { iteration: 'Iter 1', metric: 'Failover T0→T4', seconds: 38 },
+      { iteration: 'Iter 1', metric: 'Write interruption', seconds: 34 },
+      { iteration: 'Iter 2', metric: 'Failover T0→T4', seconds: 40 },
+      { iteration: 'Iter 2', metric: 'Write interruption', seconds: 35 },
+      { iteration: 'Iter 3', metric: 'Failover T0→T4', seconds: 43 },
+      { iteration: 'Iter 3', metric: 'Write interruption', seconds: 38 },
+      { iteration: 'Iter 4', metric: 'Failover T0→T4', seconds: 40 },
+      { iteration: 'Iter 4', metric: 'Write interruption', seconds: 35 },
+      { iteration: 'Iter 5', metric: 'Failover T0→T4', seconds: 41 },
+      { iteration: 'Iter 5', metric: 'Write interruption', seconds: 36 },
+    ],
+    encode: { x: 'iteration', y: 'seconds', color: 'metric' },
+    transform: [{ type: 'dodgeX' }],
+    style: { radius: 4 },
+    labels: [{ text: 'seconds', position: 'top', fontSize: 11 }],
+    axis: { y: { title: 'seconds' } },
+    legend: { color: { position: 'top' } },
+  });
+
+  chart.render();
+</script>
+</body>
+</html>

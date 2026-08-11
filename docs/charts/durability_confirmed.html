@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Durability — confirmed writes &amp; zero lost commits (G2 v5)</title>
+<script src="https://unpkg.com/@antv/g2@5/dist/g2.min.js"></script>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 24px; color: #1f2328; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  p.sub { color: #57606a; font-size: 14px; margin-top: 0; }
+  #container { width: 100%; height: 420px; }
+  p.note { color: #57606a; font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<h1>Durability — confirmed writes with zero lost commits</h1>
+<p class="sub">Rows confirmed by the workload per iteration (seed-line comm -23 method against the actual table)</p>
+<div id="container"></div>
+<p class="note">Source: docs/step6_failover_report.md §5. LOST=0 in every iteration (verified via comm -23 seed-line: nothing in .ids missing from the table). EXTRA=1 in Iter 3/4 = in-flight commit of a killed duplicate writer — more durable, not less.</p>
+<script>
+  const chart = new G2.Chart({ container: 'container', autoFit: true });
+
+  chart.options({
+    type: 'interval',
+    data: [
+      { iteration: 'Iter 1', confirmed: 21204, lost: 0 },
+      { iteration: 'Iter 2', confirmed: 21037, lost: 0 },
+      { iteration: 'Iter 3', confirmed: 7160,  lost: 0 },
+      { iteration: 'Iter 4', confirmed: 20249, lost: 0 },
+      { iteration: 'Iter 5', confirmed: 20824, lost: 0 },
+    ],
+    encode: { x: 'iteration', y: 'confirmed' },
+    style: { fill: (d) => (d.lost === 0 ? '#4e9a51' : '#d62728'), radius: 4 },
+    labels: [
+      { text: 'confirmed', position: 'top', fontSize: 11, formatter: (d) => `${d.confirmed} ✓` },
+    ],
+    axis: { y: { title: 'confirmed rows' } },
+  });
+
+  chart.render();
+</script>
+</body>
+</html>
