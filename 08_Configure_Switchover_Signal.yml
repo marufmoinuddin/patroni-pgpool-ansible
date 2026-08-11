@@ -85,10 +85,14 @@
     # ------------------------------------------------------------
     # 5. Reload pgpool (SIGHUP; sr_check_period is reloadable).
     #    NOTE: pgpool 4.7 uses positional "reload", NOT "-c reload".
+    #    Deliberately UNCONDITIONAL: if the config file was changed in
+    #    a previous (possibly failed) run, the file-guard would be
+    #    consumed and the running process would stay stale. A reload
+    #    is a cheap SIGHUP - always re-apply it so file and running
+    #    value can never drift.
     # ------------------------------------------------------------
     - name: Reload pgpool to apply sr_check_period
       ansible.builtin.command: pgpool -f {{ pgpool_conf_dir }}/pgpool.conf reload
-      when: pgpool_conf_changed.changed
       changed_when: true
 
     - name: Confirm sr_check_period in running pgpool (pool_status)
