@@ -62,7 +62,7 @@
     #    the deployed patroni.yml so this playbook is self-contained.
     # ------------------------------------------------------------
     - name: Read cluster scope from deployed patroni.yml
-      ansible.builtin.command: grep -E "^scope:" /etc/patroni/patroni.yml | awk "{print \$2}"
+      ansible.builtin.shell: grep -E "^scope:" /etc/patroni/patroni.yml | awk "{print \$2}"
       register: patroni_scope_out
       changed_when: false
 
