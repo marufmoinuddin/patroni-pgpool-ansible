@@ -64,15 +64,50 @@ ip addr show eth0 | grep 192.168.122.200   # run on other nodes
 # 4. Applications keep connecting to the SAME VIP — nothing changed for them
 ```
 
-## Test 4 — Planned Switchover (Zero Downtime)
+## Test 4 — Planned Switchover (NOT zero-downtime — detection gap)
+
+> ⚠️ **Correction (2026-08-12):** this test was previously labeled
+> "Zero Downtime". That is **not true today**. A clean `patronictl switchover`
+> does not signal pgpool: `failover_command` only fires when a backend goes
+> *down*, and a graceful switchover demotes/promotes without any backend
+> outage. pgpool therefore relies on its periodic `sr_check`/health-check
+> polling to notice the role change, and writes through the VIP fail with
+> `cannot execute CREATE TABLE in a read-only transaction` until it catches up.
 
 ```bash
-# Move leadership from db1 to db2, gracefully
+# Move leadership gracefully, e.g. db2 → db1
 patronictl -c /etc/patroni/patroni.yml switchover
 
-# Patroni: demotes db1 → promotes db2 → db1 becomes a replica
+# Patroni: demotes old leader → promotes new leader → old leader becomes a replica
 patronictl -c /etc/patroni/patroni.yml list
+
+# Watch pgpool's view catch up — expect a write blip in between
+# (run this loop until node0/db1 shows "primary primary"):
+PCPPASSFILE=/etc/pgpool-II/.pcppass pcp_node_info -h 192.168.122.200 -p 9898 -U pgpool_pcp -w 0
 ```
+
+**Observed behavior (2026-08-11 manual run, three rapid switchovers in 5 min):**
+the write blip was **~4 minutes** — switchover completed 15:29:05, pgpool still
+routed writes to the old primary at 15:32:55 (VIP writes failed
+`read-only transaction`), and re-detected the new primary by ~15:33:22. The
+three back-to-back switchovers compounded the lag; a single clean switchover
+should be quicker, but the gap is real and must not be sold as zero-downtime.
+
+**Why:** pgpool has no active signal on a clean Patroni role change. `sr_check`
+polling (`sr_check_period = 10`) is the only mechanism that updates the
+primary role, so the blip is bounded by polling cadence plus detection time.
+
+**Fix in progress:** a Patroni-side hook to signal pgpool immediately on clean
+switchover/promote (e.g. `on_role_change` callback → `pcp_attach_node` /
+`pcp_detach_node`), and/or tighter `sr_check_period`. See the design writeup
+before implementing — do not assume either option alone closes the gap.
+
+**Expected result after fix:** a materially shorter write blip. Realistic bar
+is **single-digit seconds**, not literal zero — an async, connection-pooled
+architecture always has *some* window between the old primary demoting and
+pgpool routing to the new one. Retest in isolation (one switchover, workload
+through VIP, observer on all 3 nodes) and report the measured number whatever
+it turns out to be.
 
 ## Test 5 — Automated Kill/Recovery Validation (recommended)
 
