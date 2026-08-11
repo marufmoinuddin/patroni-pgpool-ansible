@@ -49,6 +49,22 @@ Prove the HA stack self-heals correctly through **5 consecutive kill/recovery it
 | Killed-node rejoin | 36–40s (all ≤10 min budget) |
 | Timeline progression | TL 10 → 15 |
 
+### 3.1 Visualizations (AntV G2 v5)
+
+> Interactive HTML charts — open in any browser. Sources: tables above.
+
+**Failover performance — failover T0→T4 vs client-visible write interruption, per iteration**
+
+<iframe src="charts/failover_performance.html" width="100%" height="460" style="border:1px solid #d0d7de;border-radius:6px" title="Failover performance"></iframe>
+
+[Open chart: failover_performance.html](charts/failover_performance.html)
+
+**Killed-node rejoin vs the ≤10-minute budget** (all 5 landed 36–40s — a 15× margin)
+
+<iframe src="charts/rejoin_budget.html" width="100%" height="460" style="border:1px solid #d0d7de;border-radius:6px" title="Rejoin vs budget"></iframe>
+
+[Open chart: rejoin_budget.html](charts/rejoin_budget.html)
+
 ## 4. Per-iteration timelines (UTC)
 
 ### Iteration 1 (Run 3) — kill db1
@@ -107,6 +123,12 @@ Prove the HA stack self-heals correctly through **5 consecutive kill/recovery it
 | 5 | 111435 | 20824 | 20824 | **0** | 0 |
 
 Note: Iteration 3/4 EXTRA=1 rows are IDs present in the table but absent from the confirmed `.ids` file — a writer process that had committed its INSERT before being killed during the duplicate-writer cleanup. This is *more* durable, not less: the transaction was fsynced to the primary; the client simply never logged CONFIRMED. No LOST lines in any iteration.
+
+**Durability — confirmed writes per iteration, LOST=0 everywhere**
+
+<iframe src="charts/durability_confirmed.html" width="100%" height="460" style="border:1px solid #d0d7de;border-radius:6px" title="Durability confirmed"></iframe>
+
+[Open chart: durability_confirmed.html](charts/durability_confirmed.html)
 
 ## 6. Split-brain evidence
 
