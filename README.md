@@ -1666,6 +1666,45 @@ patronictl -c /etc/patroni/patroni.yml switchover
 patronictl -c /etc/patroni/patroni.yml list
 ```
 
+### Test 5 — Automated Kill/Recovery Validation (recommended)
+
+The repository ships an automated failover test harness for reproducible
+kill → observe → recover → verify cycles. See
+[`docs/step6_failover_report.md`](docs/step6_failover_report.md) for a full
+5-iteration validation run with zero lost commits and zero split-brain.
+
+```bash
+# From your workstation (NOT the db nodes), in the repo checkout:
+bash tests/failover_test_harness.sh --targets db1 --action vm-destroy --allow-leader   # dry-run first
+bash tests/failover_test_harness.sh --targets db1 --action vm-destroy --allow-leader --execute   # power-loss kill
+
+# Meanwhile, on the hypervisor/VPS:
+bash tests/step4_observer.sh ~/deploy/artifacts/run1_iter1 720 2 192.168.122.152   # split-brain observer
+
+# On a surviving node, keep a write workload running THROUGH outage + recovery:
+bash tests/txn_workload.sh run1_iter1 2400 /var/lib/pgpool-artifacts/run1_iter1
+
+# After the kill: recover the node, wait for rejoin, then verify durability
+bash tests/failover_test_harness.sh --targets db1 --action vm-start --execute
+#   comm -23 confirmed.ids table.ids  → must be EMPTY (zero lost commits)
+```
+
+**Lessons baked into the harness (do not regress these):**
+
+1. **The workload window must cover the whole recovery** (`2400` seconds = 40 min).
+   A short window (e.g. 480s) lets WAL production go idle mid-recovery; the
+   rewound former primary then stalls on segment closure and can take 40+ min
+   to rejoin. With continuous writes, rejoin is 36–40s.
+2. **The workload always seeds from a fresh atomic `SELECT COALESCE(max(id),0)`**
+   at startup — never from a remembered/`tail`-tracked value — and on a
+   duplicate-key error it retries the colliding ID at most 3 times, then
+   auto-resyncs. The old stale-seed path wedged in hundreds of failed retries.
+3. **The observer samples `pg_is_in_recovery()` directly on all 3 nodes**
+   (not just pool state) every ~2s for 720 samples, which is what proves
+   "≤1 primary at all times" — the definitive split-brain check.
+4. `vm-destroy` (virsh power loss) is the correct kill primitive; graceful
+   stops are not a valid substitute for failover testing.
+
 ---
 
 ## 12. Resilience & Self-Healing
