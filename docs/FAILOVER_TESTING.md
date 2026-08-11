@@ -94,20 +94,33 @@ three back-to-back switchovers compounded the lag; a single clean switchover
 should be quicker, but the gap is real and must not be sold as zero-downtime.
 
 **Why:** pgpool has no active signal on a clean Patroni role change. `sr_check`
-polling (`sr_check_period = 10`) is the only mechanism that updates the
-primary role, so the blip is bounded by polling cadence plus detection time.
+polling (now `sr_check_period = 3` after the fix; was 10 at the time of the
+observation) is the polling-only mechanism that updates the primary role, so
+a pure-polling design is bounded by polling cadence plus detection time.
 
-**Fix in progress:** a Patroni-side hook to signal pgpool immediately on clean
-switchover/promote (e.g. `on_role_change` callback → `pcp_attach_node` /
-`pcp_detach_node`), and/or tighter `sr_check_period`. See the design writeup
-before implementing — do not assume either option alone closes the gap.
+**Fix (implemented 2026-08-12, PR #6 — `fix/switchover-detection`):**
+a Patroni `on_role_change` callback (`/usr/local/sbin/pgpool_role_signal.sh`,
+deployed by `08_Configure_Switchover_Signal.yml`) that, on promotion, confirms
+via `patronictl` that this node is the Patroni Leader and immediately runs
+`pcp_promote_node` for its backend id on **all** pgpool nodes (including the
+VIP-holding watchdog leader). Plus `sr_check_period` tightened 10 → 3 as a
+polling safety net. Callbacks must live **inside the `postgresql:` section**
+of `patroni.yml` in this build (top-level `callbacks:` is invisible to
+`Postgresql.callback` — the original placement failed the retest).
 
-**Expected result after fix:** a materially shorter write blip. Realistic bar
-is **single-digit seconds**, not literal zero — an async, connection-pooled
-architecture always has *some* window between the old primary demoting and
-pgpool routing to the new one. Retest in isolation (one switchover, workload
-through VIP, observer on all 3 nodes) and report the measured number whatever
-it turns out to be.
+**Measured retest (2026-08-12, one clean switchover db2 → db1, VIP workload +
+3-node observer):** write blip **~3–4 seconds** (first failure 20:48:18Z,
+writes resumed 20:48:21Z; 28 failed attempts in the window, all retryable
+read-only/connection errors, **0 lost commits** — 999/999 confirmed IDs
+present on the new primary). The callback fired at 20:48:19Z and pgpool's
+`pool_nodes` flipped to `0=up/up/primary` in the same second. No split-brain
+samples (never two `recovery=f` at once). Previously: ~4 minutes.
+
+**Honest bar:** still not literal zero, and it should not be sold as such —
+an async, connection-pooled architecture always has *some* window between
+the old primary demoting and pgpool routing to the new one. Single-digit
+seconds is the legitimate target and the fix meets it. The residual window
+is the connection teardown/retry latency of in-flight client connections.
 
 ## Test 5 — Automated Kill/Recovery Validation (recommended)
 
