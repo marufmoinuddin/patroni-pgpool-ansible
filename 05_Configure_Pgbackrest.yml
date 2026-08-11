@@ -173,6 +173,8 @@
           start-fast=y
           delta=y
           backup-standby=y
+          # Bound protocol reads so a hung client session fails fast.
+          protocol-timeout=30
           
           [{{ stanza_name }}]
           {% for node in pg_nodes %}
@@ -357,6 +359,9 @@
           process-max=16
           log-level-console=info
           log-level-file=debug
+          # Bound protocol reads so a hung/half-dead SSH session fails fast
+          # instead of blocking restore_command (and promotion) for ~31min.
+          protocol-timeout=30
           
           [{{ scope }}]
           pg1-path={{ data_dir }}
@@ -422,7 +427,7 @@
         patronictl -c {{ patroni_config_file }} edit-config 
         -s postgresql.parameters.archive_mode=on
         -s postgresql.parameters.archive_command="pgbackrest --stanza={{ scope }} archive-push {{ data_dir }}/pg_wal/%f"
-        -s postgresql.recovery_conf.restore_command="pgbackrest --config=/etc/pgbackrest.conf --stanza={{ scope }} archive-get %f %p"
+        -s postgresql.recovery_conf.restore_command="timeout 60 pgbackrest --config=/etc/pgbackrest.conf --stanza={{ scope }} archive-get %f %p"
         --force
       ignore_errors: yes
 
@@ -479,18 +484,28 @@
 
     # Same host-key-prompt fix as the pgBackRest node: pgBackRest's internal ssh
     # has no StrictHostKeyChecking control; accept-new prevents a hang when the
-    # repo host's key is unknown/changed.
-    - name: Add ssh config for postgres user (avoid host-key prompt hang)
+    # repo host's key is unknown/changed. Also bound the connection so a
+    # half-dead/wedged pgBackRest host fails fast instead of blocking
+    # restore_command (and therefore promotion) indefinitely.
+    - name: Add ssh config for postgres user (bounded pgBackRest connection)
       copy:
         dest: "{{ ssh_dir }}/config"
         content: |
+          Host {{ groups['pg_backrest'][0] }}
+              HostName {{ groups['pg_backrest'][0] }}
+              ConnectTimeout 10
+              ServerAliveInterval 10
+              ServerAliveCountMax 3
+              BatchMode yes
+              StrictHostKeyChecking accept-new
+              UserKnownHostsFile ~/.ssh/known_hosts
+
           Host *
               StrictHostKeyChecking accept-new
               UserKnownHostsFile ~/.ssh/known_hosts
         owner: postgres
         group: postgres
         mode: '0600'
-      when: ansible_os_family == "Debian"
 
     - name: Ensure known_hosts has proper permissions
       file:
@@ -527,17 +542,22 @@
     # StrictHostKeyChecking. On fresh/rebuilt VMs the host key is unknown and ssh
     # blocks waiting for a host-key prompt that never comes under ansible's
     # non-interactive shell. accept-new makes it trust unknown keys silently.
-    - name: Add ssh config for postgres user (avoid host-key prompt hang)
+    # Also bound the connection so a half-dead pg node fails fast instead of
+    # hanging backups indefinitely.
+    - name: Add ssh config for postgres user (bounded pg node connections)
       copy:
         dest: "{{ ssh_dir }}/config"
         content: |
           Host *
+              ConnectTimeout 10
+              ServerAliveInterval 10
+              ServerAliveCountMax 3
+              BatchMode yes
               StrictHostKeyChecking accept-new
               UserKnownHostsFile ~/.ssh/known_hosts
         owner: postgres
         group: postgres
         mode: '0600'
-      when: ansible_os_family == "Debian"
 
     - name: Ensure known_hosts has proper permissions (pgBackRest node)
       file:

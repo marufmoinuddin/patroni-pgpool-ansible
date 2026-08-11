@@ -424,7 +424,7 @@
                         archive_mode: "on"
                         archive_timeout: 600s
                         archive_command: "pgbackrest --stanza=kyc archive-push %p"
-                        restore_command: "pgbackrest --stanza=kyc archive-get %f %p"
+                        restore_command: "timeout 60 pgbackrest --stanza=kyc archive-get %f %p"
 
             initdb:
                 - encoding: UTF8

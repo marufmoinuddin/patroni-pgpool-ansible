@@ -189,6 +189,25 @@
           fi
           [ "$LEADER_PRESENT" -ne 1 ] && { CRITICAL=1; log "CRITICAL no Patroni leader"; }
 
+          # --- leader writability (DCS leader must actually accept writes) ---
+          # A DCS "Leader" whose postgres is still in recovery is strictly worse
+          # than no leader: Patroni keeps reporting "no action / leader with the
+          # lock" (upstream issue #3603) and pgpool has nothing better to route
+          # to. Probe the leader's Patroni REST API and flag role != primary.
+          # Detection + alert only -- no automatic restart.
+          LEADER_WRITABLE=1; LEADER_HOST=""
+          if [ "$LEADER_PRESENT" -eq 1 ]; then
+            LEADER_HOST=$(echo "$LIST" | jq -r '[.[] | select(.Role == "Leader")][0].Host // ""' 2>/dev/null)
+            if [ -n "$LEADER_HOST" ] && [ "$LEADER_HOST" != "null" ]; then
+              LEADER_ROLE=$(curl -s -m 5 "http://${LEADER_HOST}:8008/patroni" 2>/dev/null | jq -r '.role // "unknown"' 2>/dev/null)
+              if [ -n "$LEADER_ROLE" ] && [ "$LEADER_ROLE" != "primary" ]; then
+                LEADER_WRITABLE=0
+                CRITICAL=1
+                log "CRITICAL leader $LEADER_MEMBER ($LEADER_HOST) is NOT writable (REST role=$LEADER_ROLE, pg_is_in_recovery=true) - DCS leader but read-only"
+              fi
+            fi
+          fi
+
           # --- pgpool watchdog + backends ----------------------------------------
           WD_QUORUM=0
           export PCPPASSFILE="$PCPPASS"
@@ -219,7 +238,7 @@
             VIP_PRESENT=1
           fi
 
-          log "status: leader=$LEADER_MEMBER etcd=$ETCD_UP/$ETCD_TOTAL wd_quorum=$WD_QUORUM backends=$BACKENDS_UP/$BACKENDS_TOTAL vip=$VIP_PRESENT members=$MEMBERS_TOTAL nonrunning=$MEMBERS_NONRUN"
+          log "status: leader=$LEADER_MEMBER leader_writable=$LEADER_WRITABLE etcd=$ETCD_UP/$ETCD_TOTAL wd_quorum=$WD_QUORUM backends=$BACKENDS_UP/$BACKENDS_TOTAL vip=$VIP_PRESENT members=$MEMBERS_TOTAL nonrunning=$MEMBERS_NONRUN"
           if [ "$CRITICAL" -eq 1 ]; then
             log "RESULT CRITICAL"
           else
@@ -229,6 +248,7 @@
           # --- Prometheus textfile metrics (PMM node_exporter scrape) --------------
           PROM="patroni_leader_present $LEADER_PRESENT
           patroni_leader{member=\"$LEADER_MEMBER\"} $LEADER_PRESENT
+          patroni_leader_writable $LEADER_WRITABLE
           patroni_members_total $MEMBERS_TOTAL
           patroni_members_nonrunning $MEMBERS_NONRUN
           etcd_healthy $ETCD_HEALTHY
@@ -247,7 +267,7 @@
 
           # --- alert hook -----------------------------------------------------------
           if [ "$CRITICAL" -eq 1 ] && [ -n "$ALERT_CMD" ]; then
-            $ALERT_CMD "CLUSTER CRITICAL: etcd_quorum=$ETCD_QUORUM leader=$LEADER_MEMBER wd_quorum=$WD_QUORUM backends=$BACKENDS_UP/$BACKENDS_TOTAL"
+            $ALERT_CMD "CLUSTER CRITICAL: etcd_quorum=$ETCD_QUORUM leader=$LEADER_MEMBER leader_writable=$LEADER_WRITABLE wd_quorum=$WD_QUORUM backends=$BACKENDS_UP/$BACKENDS_TOTAL"
           fi
 
           exit "$CRITICAL"
