@@ -83,10 +83,11 @@
       register: pgpool_conf_changed
 
     # ------------------------------------------------------------
-    # 5. Reload pgpool (SIGHUP; sr_check_period is reloadable)
+    # 5. Reload pgpool (SIGHUP; sr_check_period is reloadable).
+    #    NOTE: pgpool 4.7 uses positional "reload", NOT "-c reload".
     # ------------------------------------------------------------
     - name: Reload pgpool to apply sr_check_period
-      ansible.builtin.command: pgpool -c reload
+      ansible.builtin.command: pgpool -f {{ pgpool_conf_dir }}/pgpool.conf reload
       when: pgpool_conf_changed.changed
       changed_when: true
 
