@@ -57,12 +57,19 @@
 
     # ------------------------------------------------------------
     # 3. Reload Patroni so the callback takes effect
-    #    (SIGHUP re-reads patroni.yml; callbacks load from config)
+    #    (SIGHUP re-reads patroni.yml; callbacks load from config).
+    #    patronictl reload REQUIRES the cluster scope; derive it from
+    #    the deployed patroni.yml so this playbook is self-contained.
     # ------------------------------------------------------------
+    - name: Read cluster scope from deployed patroni.yml
+      ansible.builtin.command: grep -E "^scope:" /etc/patroni/patroni.yml | awk "{print \$2}"
+      register: patroni_scope_out
+      changed_when: false
+
     - name: Reload Patroni to pick up callbacks
-      ansible.builtin.command: patronictl -c /etc/patroni/patroni.yml reload
+      ansible.builtin.command: patronictl -c /etc/patroni/patroni.yml reload "{{ patroni_scope_out.stdout }}"
       register: patroni_reload
-      changed_when: "'No scheduled restart' in patroni_reload.stdout or patroni_reload.rc == 0"
+      changed_when: patroni_reload.rc == 0
       failed_when: patroni_reload.rc != 0
 
     # ------------------------------------------------------------
