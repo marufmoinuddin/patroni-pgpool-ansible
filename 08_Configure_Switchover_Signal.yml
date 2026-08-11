@@ -65,9 +65,7 @@
         path: /etc/patroni/patroni.yml
         marker: "# {mark} ANSIBLE MANAGED: pgpool role-signal callback"
         insertbefore: "^tags:"
-        block: |
-                callbacks:
-                    on_role_change: {{ callback_script }}
+        block: "    callbacks:\n        on_role_change: {{ callback_script }}\n"
       register: patroni_yml_changed
 
     # ------------------------------------------------------------
