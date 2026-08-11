@@ -202,7 +202,8 @@ def main():
     check("etcd3 lists ALL endpoints", "hosts: 192.168.122.200:2379,192.168.122.201:2379,192.168.122.202:2379" in patroni_yml)
     check("old single-host etcd3 removed", "host: {{ node_ip }}:2379" not in patroni_yml)
     check("watchdog section present", "watchdog:" in patroni_yml and "/dev/watchdog" in patroni_yml and "safety_margin: 5" in patroni_yml)
-    check("pgpool role-signal callback present", "callbacks:" in patroni_yml and "on_role_change: /usr/local/sbin/pgpool_role_signal.sh" in patroni_yml)
+    check("pgpool role-signal callback present INSIDE postgresql (this build reads callbacks from postgresql subsection)",
+          "    callbacks:\n        on_role_change: /usr/local/sbin/pgpool_role_signal.sh" in patroni_yml)
     check("pg_hba still intact", "host replication replicator 0.0.0.0/0 scram-sha-256" in patroni_yml)
     check("archive_command still intact", "pgbackrest --stanza=kyc archive-push" in patroni_yml)
 
