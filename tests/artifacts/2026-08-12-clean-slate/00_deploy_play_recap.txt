@@ -1,0 +1,15 @@
+ansible-playbook -i hosts.ini site.yml — 2026-08-12 clean-slate deploy
+(from the VPS: ~/git/patroni-pgpool-ansible, commit 350cc2e, main)
+
+PLAY RECAP *********************************************************************
+percona-node-1             : ok=178  changed=84   unreachable=0    failed=0    skipped=40   rescued=0    ignored=1
+percona-node-2             : ok=156  changed=75   unreachable=0    failed=0    skipped=39   rescued=0    ignored=1
+percona-node-3             : ok=156  changed=75   unreachable=0    failed=0    skipped=39   rescued=0    ignored=1
+percona-pgbackrest         : ok=57   changed=25   unreachable=0    failed=0    skipped=20   rescued=0    ignored=1
+
+4 hosts, 0 unreachable, 0 failed.
+Playbooks: 01 install/deps, 02 etcd, 03 patroni (incl. switchover callback), 04 pgpool+watchdog,
+05 pgbackrest, 06 PMM (SKIPPED by policy — commented in site.yml), 07 cluster-health.
+
+Hosts: percona-node-1=db1=192.168.122.150, percona-node-2=db2=192.168.122.151,
+percona-node-3=db3=192.168.122.152, percona-pgbackrest=br1=192.168.122.153.
