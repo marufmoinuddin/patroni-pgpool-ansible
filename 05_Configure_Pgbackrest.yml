@@ -229,6 +229,8 @@
 - name: Configure PostgreSQL nodes for pgBackRest
   hosts: pg_nodes
   become: true
+  vars_files:
+    - credentials.yaml
   vars:
     scope: "{{ patroni_scope }}"
     pgversion: "16"
@@ -433,6 +435,8 @@
 - name: Update Patroni Configuration for pgBackRest
   hosts: pg_nodes[0]
   become: true
+  vars_files:
+    - credentials.yaml
   vars:
     scope: "{{ patroni_scope }}"
     pgversion: "16"
@@ -456,6 +460,8 @@
 - name: Set up SSH Authentication Between PostgreSQL Nodes and pgBackRest Server
   hosts: pg_nodes
   become: true
+  vars_files:
+    - credentials.yaml
   vars:
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
   tasks:
@@ -542,6 +548,8 @@
 - name: Now start stanza creation
   hosts: pg_backrest
   become: true
+  vars_files:
+    - credentials.yaml
   vars:
     scope: "{{ patroni_scope }}"
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
