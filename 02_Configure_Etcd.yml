@@ -116,6 +116,36 @@
     # ----------------------------------------------------------------------
     # SYSTEMD UNIT: concrete values, no fragile Environment indirection.
     # ----------------------------------------------------------------------
+    # DEBIAN/UBUNTU FIX (2026-08-12, first Ubuntu/Debian-family deploy):
+    # the Debian etcd-server package postinst AUTO-STARTS the service with the
+    # packaged unit (/usr/bin/etcd --config-file /etc/etcd/etcd.conf.yaml),
+    # which binds 127.0.0.1 and bootstraps a bogus single-member "default"
+    # cluster. A later systemctl start is then a NO-OP on the already-active
+    # service, so the custom unit below never takes effect and Patroni's
+    # etcd3.hosts validation fails ("192.168.122.x:2379 is not reachable").
+    # Detect that state and stop it BEFORE writing the custom unit, and remove
+    # the stale packaged data dir (default.etcd) so a fresh 3-member cluster
+    # bootstraps cleanly. On healthy re-runs the running command is the custom
+    # unit (no --config-file), so this is skipped and the cluster is untouched.
+    - name: Detect if ETCD is running the packaged config-file unit (Debian postinst auto-start)
+      ansible.builtin.command: pgrep -af "/usr/bin/etcd --config-file"
+      register: packaged_etcd_proc
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Stop packaged ETCD instance so the custom unit can take over (Debian)
+      ansible.builtin.systemd:
+        name: etcd
+        state: stopped
+      when: ansible_os_family == "Debian" and packaged_etcd_proc.rc == 0
+
+    - name: Remove stale packaged etcd data dir (Debian fresh-install residue)
+      ansible.builtin.file:
+        path: "{{ etcd_data_dir }}/default.etcd"
+        state: absent
+      when: ansible_os_family == "Debian" and packaged_etcd_proc.rc == 0
+
     - name: Create systemd service file
       ansible.builtin.copy:
         dest: /etc/systemd/system/etcd.service
