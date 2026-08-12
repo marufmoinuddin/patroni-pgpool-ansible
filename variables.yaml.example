@@ -3,12 +3,12 @@
 # EXTERNAL CREDENTIALS FILE — Manage all secrets here (use ansible-vault encrypt)
 # =============================================================================
 # Usage:
-#   1. Copy this file to credentials.yaml
+#   1. Copy this file to variables.yaml
 #   2. Fill in your real values
-#   3. Encrypt: ansible-vault encrypt credentials.yaml
+#   3. Encrypt: ansible-vault encrypt variables.yaml
 #   4. Run playbooks with: ansible-playbook -i hosts site.yml --ask-vault-pass
 #
-# All playbooks include this file via: vars_files: [ "credentials.yaml" ]
+# All playbooks include this file via: vars_files: [ "variables.yaml" ]
 # =============================================================================
 
 # --- Cluster Identity ---

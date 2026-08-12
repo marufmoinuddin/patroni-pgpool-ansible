@@ -230,7 +230,7 @@
   hosts: pg_nodes
   become: true
   vars_files:
-    - credentials.yaml
+    - variables.yaml
   vars:
     scope: "{{ patroni_scope }}"
     pgversion: "16"
@@ -436,7 +436,7 @@
   hosts: pg_nodes[0]
   become: true
   vars_files:
-    - credentials.yaml
+    - variables.yaml
   vars:
     scope: "{{ patroni_scope }}"
     pgversion: "16"
@@ -461,7 +461,7 @@
   hosts: pg_nodes
   become: true
   vars_files:
-    - credentials.yaml
+    - variables.yaml
   vars:
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
   tasks:
@@ -549,7 +549,7 @@
   hosts: pg_backrest
   become: true
   vars_files:
-    - credentials.yaml
+    - variables.yaml
   vars:
     scope: "{{ patroni_scope }}"
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
