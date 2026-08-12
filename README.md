@@ -10,9 +10,11 @@ Welcome! This repository builds a **production-grade, 3-node high-availability P
   - **CentOS/RHEL:** pgpool-II 4.7 (Percona package, config in `/etc/pgpool-II`, separate `pgpool_watchdog.conf`)
   - **Debian/Ubuntu:** native `pgpool2` 4.3.5 (Debian repo, config in `/etc/pgpool2`, watchdog params inline in `pgpool.conf`)
 - **pgBackRest** — backup & point-in-time recovery
-- **PMM (Percona Monitoring & Management)** — dashboards and alerts
+- **PMM (Percona Monitoring & Management)** — dashboards and alerts (optional, policy-controlled)
 
 You can deploy everything **automatically with Ansible** (recommended), or **step-by-step by hand** (great for learning exactly what is happening under the hood). Both paths are documented below.
+
+> **This architecture has been stress-tested with real fault injection** — 5 consecutive power-loss failovers, an asymmetric network partition test that uncovered and fixed a Patroni `archive-get` hang (upstream #3603), a cascading failure test that identified etcd as a write-availability SPOF, and a switchover detection gap (~4 min) that was **fixed and measured** (active `on_role_change` callback + `sr_check_period = 3` → **~3–4 s write-availability gap**, 999/999 confirmed writes survived, 0 lost, no split-brain). See [Deployment Result — Validated](#11-deployment-result--validated) and [Failure Testing](docs/FAILOVER_TESTING.md) for the full evidence.
 
 ---
 
@@ -556,17 +558,29 @@ All nodes must resolve each other by hostname. Configure via `/etc/hosts` or int
 ## 7. What's Inside This Repository
 
 ```
-patroni-ansible/
-├── site.yml                        ← Master playbook: runs 01→06 in order
-├── hosts                           ← Inventory: 4 nodes (3 PG + 1 backup)
+patroni-pgpool-ansible/
+├── site.yml                        ← Master playbook: runs 01→08 in order
+├── hosts.ini.example               ← Inventory template: 3 PG nodes + 1 backup (copy to hosts.ini)
 ├── ansible.cfg                     ← Ansible settings (root-based, no sudo prompts)
 ├── README.md                       ← This file
 ├── 01_Install_Percona.yml          ← Repos, packages, prerequisites
 ├── 02_Configure_Etcd.yml           ← 3-node etcd cluster
 ├── 03_Configure_Patroni.yml        ← PostgreSQL 16 + Patroni HA bootstrap
-├── 04_Configure_Pgpool.yml         ← pgpool-II 4.5 + Watchdog + VIP
+├── 04_Configure_Pgpool.yml         ← pgpool-II 4.7/4.3.5 + Watchdog + VIP (OS-conditional)
 ├── 05_Configure_Pgbackrest.yml     ← pgBackRest server + client integration
-└── 06_Install_Pmm_Monitoring.yml   ← PMM Server (Docker) + PMM Client
+├── 06_Install_Pmm_Monitoring.yml   ← PMM Server (Docker) + PMM Client
+├── 07_Configure_Cluster_Health.yml ← Self-healing timers + health monitor + Prometheus metrics
+├── 08_Configure_Switchover_Signal.yml ← Patroni on_role_change callback → pgpool active notification
+├── tests/                          ← Fault-injection harness (failover_test_harness.sh, step4_observer.sh, txn_workload.sh)
+├── docs/                           ← Validation reports and procedures
+│   ├── FAILOVER_TESTING.md         ← How to run Tests 1-5
+│   └── step6_failover_report.md    ← 5/5 PASS evidence with timelines, durability, split-brain
+├── files/                          ← Supporting scripts deployed by playbooks
+│   └── pgpool_role_signal.sh       ← Patroni callback for active switchover notification
+│                                     (reattach_nodes.sh, wait_for_etcd.sh, cluster_health.sh are
+│                                     deployed inline from their playbooks — see the design note below)
+├── variables.yaml.example          ← All secrets + tunables (copy → variables.yaml, encrypt with ansible-vault)
+└── SKILLS.md                       ← Internal skill references for development
 ```
 
 > 💡 **Design choice:** every config file is written **inline** in the playbooks (via `copy: content: |`) — no `templates/` directory. This makes each playbook fully self-contained: you see the exact config being deployed without opening another file.
@@ -577,10 +591,12 @@ patroni-ansible/
 |---|----------|------------------------------|
 | 01 | `01_Install_Percona.yml` | Adds the Percona repository, enables EPEL + CRB (RHEL), installs PostgreSQL 16, Patroni, etcd, pgpool-II, pgBackRest, jq — and **purges any old/broken installs** so you start clean. On **Debian**: installs native `pgpool2` **BEFORE** enabling Percona repo, then pins `libpgpool2=4.3.5*` to prevent version conflicts with Percona's PostgreSQL 16 modules. |
 | 02 | `02_Configure_Etcd.yml` | Writes the etcd config on all 3 nodes, **wipes stale etcd data** (so a re-run bootstraps cleanly), starts etcd, and verifies quorum. |
-| 03 | `03_Configure_Patroni.yml` | Creates the PostgreSQL data directory, writes `patroni.yml` (the full HA config), installs the systemd unit, **starts the primary first**, waits, then starts replicas — then verifies with `patronictl list`. |
-| 04 | `04_Configure_Pgpool.yml` | Writes `pgpool.conf` + **OS-conditional watchdog config** (CentOS: separate `pgpool_watchdog.conf` with 4.7 params; Debian: inline in `pgpool.conf` with legacy 4.3.5 params), `pool_hba.conf` + `pool_passwd` + `pcp.conf`, deploys Patroni-aware `failover.sh` / `follow_master.sh`, sets `pgpool_node_id`, and starts the watchdog cluster so the VIP is claimed. **Auto-detects VIP interface** (`eth0` on CentOS, `enp3s0` on Debian). |
+| 03 | `03_Configure_Patroni.yml` | Creates the PostgreSQL data directory, writes `patroni.yml` (the full HA config with pgtune-calculated parameters, watchdog, callbacks), installs the systemd unit with `ExecStartPre` waiting for etcd, **starts the primary first**, waits, then starts replicas — then verifies with `patronictl list`. |
+| 04 | `04_Configure_Pgpool.yml` | Writes `pgpool.conf` + **OS-conditional watchdog config** (CentOS: separate `pgpool_watchdog.conf` with 4.7 params; Debian: inline in `pgpool.conf` with legacy 4.3.5 params), `pool_hba.conf` + `pool_passwd` (plaintext for SCRAM) + `pcp.conf`, deploys Patroni-aware `failover.sh` / `follow_master.sh`, sets `pgpool_node_id`, and starts the watchdog cluster so the VIP is claimed. **Auto-detects VIP interface** (`eth0` on CentOS, `enp3s0` on Debian). |
 | 05 | `05_Configure_Pgbackrest.yml` | Installs/connects pgBackRest on the backup node, exchanges SSH keys with all PG nodes (using `StrictHostKeyChecking accept-new` for non-interactive automation), writes `pgbackrest.conf` with stanza `kyc`, and prints the exact commands to create the stanza + first backup. |
 | 06 | `06_Install_Pmm_Monitoring.yml` | Pulls and runs the PMM Server Docker container on the backup node (cleans stale `pmm-data` volume first), opens the firewall for it, installs PMM Client on all 3 PG nodes (skips `pg_stat_monitor` on Debian where the package doesn't exist), and registers them with the server. |
+| 07 | `07_Configure_Cluster_Health.yml` | Deploys two systemd timers: `patroni-self-heal.timer` (30s, restarts crashed local Patroni member) and `cluster-health.timer` (60s, checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence). Logs to `/var/log/patroni/cluster_health.log`, writes Prometheus textfile metrics for PMM's node_exporter, fires `health_alert_command` on CRITICAL. Also deploys durable event log (`leader_events.log`) and monotonic Prometheus counters for every leader election, read-only leader event, and etcd quorum loss. |
+| 08 | `08_Configure_Switchover_Signal.yml` | Deploys `pgpool_role_signal.sh` as Patroni's `on_role_change` callback. On promotion to primary, it confirms via `patronictl` that THIS node holds the DCS leader lease, maps the local IP to a pgpool backend node_id, and runs `pcp_promote_node` on ALL pgpool nodes (including the VIP-holding watchdog leader) — eliminating the ~4-minute polling gap observed on clean switchover. |
 
 ### Default Values You Should Know
 
@@ -1601,43 +1617,28 @@ sudo -iu postgres pgbackrest --stanza=kyc --type=time \
 
 ## 11. Deployment Result — Validated
 
-This architecture has been **deployed end-to-end and validated on real hardware
-(kernel-level VMs), not just designed**. The automated failover harness in
-[`tests/`](tests/) was used to power-loss kill the cluster's leader five times
-in a row (`virsh destroy` — no graceful stops), observe every failover, and
-verify the recovery. The complete evidence — per-iteration timelines,
-durability tables, split-brain sample counts — lives in the
-**[Step 6 Failover Validation Report](docs/step6_failover_report.md)**; the
-exact procedures to reproduce the run are in
-**[Failure Testing](docs/FAILOVER_TESTING.md)**.
+This architecture has been **deployed end-to-end and validated on real hardware (kernel-level VMs), not just designed**. The automated failover harness in [`tests/`](tests/) was used to power-loss kill the cluster's leader five times in a row (`virsh destroy` — no graceful stops), observe every failover, and verify the recovery. The complete evidence — per-iteration timelines, durability tables, split-brain sample counts — lives in the **[Step 6 Failover Validation Report](docs/step6_failover_report.md)**; the exact procedures to reproduce the run are in **[Failure Testing](docs/FAILOVER_TESTING.md)**.
 
 **Validated headline facts:**
 
-- ✅ **5 / 5 consecutive power-loss failover iterations passed** (kills
-  rotated across all three nodes: db1 → db3 → db1 → db3 → db2)
-- ✅ **Zero lost commits** across ~104,000 confirmed writes (seed-line
-  `comm -23` vs the actual table, every run)
-- ✅ **Zero split-brain** across **3,600 direct node probes** (720 samples × 5
-  iterations; ≤1 node primary at all times)
-- ✅ **~40s median failover** (38–43s from power loss to first successful write
-  on the new primary), write interruption 34–38s
-- ✅ **Killed-node rejoin 36–40s** — far inside the ≤10-minute budget, via
-  Patroni's normal re-bootstrap (`pg_rewind` + WAL catch-up); no Ansible
-  re-provisioning, no manual intervention
-- ✅ **Single-node failure tolerance confirmed** — the cluster survives losing
-  *any one* host (database node *or* etcd quorum member). It does **not**
-  survive losing two hosts at once; that requires the 3–5 witness etcd
-  topology (see [§12](#12-resilience--self-healing)).
+- ✅ **5 / 5 consecutive power-loss failover iterations passed** (kills rotated across all three nodes: db1 → db3 → db1 → db3 → db2)
+- ✅ **Zero lost commits** across ~104,000 confirmed writes (seed-line `comm -23` vs the actual table, every run)
+- ✅ **Zero split-brain** across **3,600 direct node probes** (720 samples × 5 iterations; ≤1 node primary at all times)
+- ✅ **~40s median failover** (38–43s from power loss to first successful write on the new primary), write interruption 34–38s
+- ✅ **Killed-node rejoin 36–40s** — far inside the ≤10-minute budget, via Patroni's normal re-bootstrap (`pg_rewind` + WAL catch-up); no Ansible re-provisioning, no manual intervention
+- ✅ **Single-node failure tolerance confirmed** — the cluster survives losing *any one* host (database node *or* etcd quorum member). It does **not** survive losing two hosts at once; that requires the 3–5 witness etcd topology (see [§12](#12-resilience--self-healing)).
 
-> ⚠️ **Honest caveat — async replication.** Replication is asynchronous
-> (`synchronous_standby_names` not set). A transaction committed on the old
-> primary moments before a power loss can, in the worst case, be absent from
-> the promoted replica. Zero lost commits were observed across all five runs,
-> but that is empirical evidence, not a design guarantee: for zero-RPO the
-> stack must be switched to synchronous replication. The 34–38s write
-> interruption is the client-visible failover window (pgpool health-polling +
-> Patroni election + attach cycle) — not zero downtime; stateful clients must
-> retry.
+### Additional Fault-Injection Validation (beyond the 5 clean kills)
+
+| Test | Scenario | Finding | Resolution |
+|------|----------|---------|------------|
+| **Test 1** | Watchdog timing audit | Config math correct (TTL=30s, safety_margin=5s, hardware i6300ESB available) | ✅ Passed |
+| **Test 2** | **Asymmetric network partition** (iptables cut primary off from etcd/peers but left client-facing VIP open) | Primary self-demoted in 17–35s ✅, but promotion **hung >2h** due to `pgbackrest archive-get` without timeout on wedged SSH to backup node (upstream Patroni #3603) | **Fixed:** `restore_command: "timeout 60 pgbackrest..."`, pgbackrest `protocol-timeout`, SSH `ServerAliveInterval=10`, + "leader but read-only" detection check. Re-run: **31s promotion, 140/140 writes survived** |
+| **Test 3** | **Mixed/cascading failure** (etcd node loss + 30% packet loss on survivors) | **DCS (etcd) is a single point of failure for write availability** — 2/3 PG nodes healthy, 0 writable primaries because 2-of-3 etcd quorum unreachable. Cluster correctly chose safe-unavailable (0 data loss) | Documented as architectural limitation; mitigations: dedicated etcd witnesses, decoupled DCS failure domain, 5-node etcd topology |
+| **Test 4** | Durable false-positive logging (soak instrumentation) | Built append-only event log + Prometheus counters; smoke test found a 2nd bug: a timed-out leader REST probe produced an empty `LEADER_ROLE=""` which skipped the writability guard, so a stuck leader passed as healthy | **Fixed:** empty/timeout → `role="unknown"` → NOT writable (fc0a736) |
+| **Live discovery** | Manual planned switchover (`patronictl switchover`) | pgpool has no active signal on clean switchover — relies on `sr_check` polling → **~4 min write-availability gap** observed (15:29:05 → 15:33:22) | **Fixed & verified:** `pgpool_role_signal.sh` callback (Patroni `on_role_change` → `pcp_promote_node` on all pgpool nodes) + `sr_check_period 10→3` → **~3–4 s gap, 999/999 writes survived, 0 lost, no split-brain** (PLA 1, 2026-08-12) |
+
+> ⚠️ **Honest caveat — async replication.** Replication is asynchronous (`synchronous_standby_names` not set). A transaction committed on the old primary moments before a power loss can, in the worst case, be absent from the promoted replica. Zero lost commits were observed across all five runs, but that is empirical evidence, not a design guarantee: for zero-RPO the stack must be switched to synchronous replication. The 34–38s write interruption is the client-visible failover window (pgpool health-polling + Patroni election + attach cycle) — not zero downtime; stateful clients must retry.
 
 Full methodology and raw evidence:
 
@@ -1650,8 +1651,7 @@ Full methodology and raw evidence:
 
 ## 12. Resilience & Self-Healing
 
-This repository applies a set of resilience fixes so the cluster survives
-**single-host loss** without manual intervention, and *tells you* when it can't.
+This repository applies a set of resilience fixes so the cluster survives **single-host loss** without manual intervention, and *tells you* when it can't.
 
 ### 12.1 DCS (etcd) Redundancy
 
@@ -1661,45 +1661,27 @@ This repository applies a set of resilience fixes so the cluster survives
 | **etcd on 3 dedicated witnesses** (`etcd_group: "etcd_nodes"`) | 1 etcd node, **plus** a DB host crash never touches quorum | DCS and DB failure domains are decoupled |
 | etcd on **5 witnesses** | 2 etcd nodes | Tolerates two concurrent host losses end-to-end |
 
-To use dedicated witnesses: add an `[etcd_nodes]` group (odd member count) to
-`hosts.ini` and set `etcd_group: "etcd_nodes"` in `variables.yaml`. Playbook
-`02` targets that group; Patroni on `pg_nodes` then talks to **all** etcd
-endpoints (`etcd3.hosts`), so a local etcd failure never blinds Patroni.
+To use dedicated witnesses: add an `[etcd_nodes]` group (odd member count) to `hosts.ini` and set `etcd_group: "etcd_nodes"` in `variables.yaml`. Playbook `02` targets that group; Patroni on `pg_nodes` then talks to **all** etcd endpoints (`etcd3.hosts`), so a local etcd failure never blinds Patroni.
 
 ### 12.2 Fencing: softdog Watchdog (split-brain protection)
 
-`03_Configure_Patroni.yml` loads the kernel **softdog** module and configures
-Patroni's watchdog (`mode: automatic`, `/dev/watchdog`). If a primary is
-partitioned and loses DCS quorum, Patroni stops feeding the watchdog → the
-kernel **reboots the host** instead of letting a stale primary accept writes.
-Disable with `patroni_watchdog: false` (e.g. on hardware with an external BMC).
+`03_Configure_Patroni.yml` loads the kernel **softdog** module and configures Patroni's watchdog (`mode: automatic`, `/dev/watchdog`). If a primary is partitioned and loses DCS quorum, Patroni stops feeding the watchdog → the kernel **reboots the host** instead of letting a stale primary accept writes. Hardware watchdog `i6300ESB` is also supported for stronger guarantees. Disable with `patroni_watchdog: false` (e.g. on hardware with an external BMC).
 
 ### 12.3 Boot Ordering & Restart Policy
 
-- `etcd.service` now waits for `network-online.target`, never has its data
-  directory wiped on re-runs, and uses `initial-cluster-state: existing` when
-  member data already exists (fresh bootstrap still uses `new`).
-- `patroni.service` has `Requires=etcd.service` (co-located mode),
-  `After=network-online.target`, an `ExecStartPre` that **waits up to
-  `etcd_wait_timeout` (90s) for a reachable etcd endpoint**, and
-  `Restart=on-failure` with `StartLimitIntervalSec=0` — it never gives up.
+- `etcd.service` now waits for `network-online.target`, never has its data directory wiped on re-runs, and uses `initial-cluster-state: existing` when member data already exists (fresh bootstrap still uses `new`).
+- `patroni.service` has `Requires=etcd.service` (co-located mode), `After=network-online.target`, an `ExecStartPre` that **waits up to `etcd_wait_timeout` (90s) for a reachable etcd endpoint**, and `Restart=on-failure` with `StartLimitIntervalSec=0` — it never gives up.
 - `pgpool.service` got `Restart=always` plus `network-online.target` ordering.
-- **Data-dir guards:** playbooks `02`/`03` refuse to run when the etcd or
-  PostgreSQL data directory sits on volatile storage (tmpfs/ramfs) — data must
-  survive reboots.
+- **Data-dir guards:** playbooks `02`/`03` refuse to run when the etcd or PostgreSQL data directory sits on volatile storage (tmpfs/ramfs) — data must survive reboots.
 
-> ⚠️ Re-running `site.yml` on a healthy cluster **no longer wipes etcd**.
-> Only `etcd_force_reset: true` (fresh bootstrap / DR restore) wipes the DCS.
+> ⚠️ Re-running `site.yml` on a healthy cluster **no longer wipes etcd**. Only `etcd_force_reset: true` (fresh bootstrap / DR restore) wipes the DCS.
 
 ### 12.4 pgpool Watchdog Hardening
 
-- `heartbeat_port` (default `9694`) is now defined everywhere — it **must
-  differ** from `wd_port` (`9000`) or watchdog heartbeats collide.
-- `wd_quorum_exit = on` (default): a pgpool instance that loses watchdog
-  quorum **exits** instead of serving the VIP alone → no split-brain VIP.
+- `heartbeat_port` (default `9694`) is now defined everywhere — it **must differ** from `wd_port` (`9000`) or watchdog heartbeats collide.
+- `wd_quorum_exit = on` (default): a pgpool instance that loses watchdog quorum **exits** instead of serving the VIP alone → no split-brain VIP.
 - `wd_authkey` is configurable via `watchdog_authkey` (identical on all nodes).
-- Duplicate config keys were removed from `pgpool.conf` (last-wins behaviour
-  was a silent trap).
+- Duplicate config keys were removed from `pgpool.conf` (last-wins behaviour was a silent trap).
 
 ### 12.5 Self-Healing (07_Configure_Cluster_Health.yml)
 
@@ -1709,63 +1691,43 @@ Disable with `patroni_watchdog: false` (e.g. on hardware with an external BMC).
 | `cluster-health.timer` | 60s | Checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence. Logs to `/var/log/patroni/cluster_health.log`, writes Prometheus textfile metrics for PMM, fires `health_alert_command` on CRITICAL |
 
 Metrics exposed (scraped by PMM's node_exporter textfile collector):
-`patroni_leader_present`, `patroni_leader{member=}`, `patroni_members_total`,
-`patroni_members_nonrunning`, `etcd_healthy`, `etcd_quorum`,
-`pgpool_wd_quorum`, `pgpool_backends_total/up`, `vip_present`.
+`patroni_leader_present`, `patroni_leader{member=}`, `patroni_members_total`, `patroni_members_nonrunning`, `etcd_healthy`, `etcd_quorum`, `pgpool_wd_quorum`, `pgpool_backends_total/up`, `vip_present`.
 
-Durable event log (Test 4 instrumentation): every leader election/change,
-leader-lost, DCS-leader-but-read-only false positive, writability-restored,
-and etcd quorum loss/restore is appended to
-`/var/log/patroni/leader_events.log` (ISO-8601 timestamps) and counted in
-monotonic Prometheus counters `patroni_leader_changes_total`,
-`patroni_leader_read_only_events_total`, `patroni_leader_lost_events_total`,
-`patroni_etcd_quorum_loss_total` — so a long soak produces a reviewable,
-queryable record of every transition instead of a flat log you have to grep.
+Durable event log (Test 4 instrumentation): every leader election/change, leader-lost, DCS-leader-but-read-only false positive, writability-restored, and etcd quorum loss/restore is appended to `/var/log/patroni/leader_events.log` (ISO-8601 timestamps) and counted in monotonic Prometheus counters `patroni_leader_changes_total`, `patroni_leader_read_only_events_total`, `patroni_leader_lost_events_total`, `patroni_etcd_quorum_loss_total` — so a long soak produces a reviewable, queryable record of every transition instead of a flat log you have to grep.
 
-Set `health_alert_command` (e.g. a webhook curl) in `variables.yaml` to get
-paged *before* an outage becomes permanent.
+Set `health_alert_command` (e.g. a webhook curl) in `variables.yaml` to get paged *before* an outage becomes permanent.
 
-### 12.6 What About "All Hosts Down"?
+### 12.6 Active Switchover Notification (08_Configure_Switchover_Signal.yml)
 
-No HA topology survives every node dying at once — that is disaster recovery,
-not high availability. Documented restore path: bring etcd up first (members
-with `initial-cluster-state: existing`), then Patroni on one node, then the
-rest — or restore from pgBackRest if data is unrecoverable. The fixes above
-buy you: **losing any single host** (or two, with 5-node etcd) with **no total
-outage**.
+Patroni's `on_role_change` callback (`files/pgpool_role_signal.sh`) eliminates the ~4-minute polling gap on clean switchover:
 
-### 12.7 Named Architectural Finding: DCS is a Single Point of Failure for Write Availability
+1. **Trigger:** Patroni invokes callback on promotion to primary
+2. **Authority check:** Confirms via `patronictl list -f json` that THIS node holds the DCS leader lease (etcd is the single source of truth — blocks old primary during any split-brain window)
+3. **Mapping:** Maps local hostname/IP → pgpool backend node_id from `pgpool.conf`
+4. **Notification:** Runs `pcp_promote_node` on ALL pgpool nodes (including the VIP-holding watchdog leader, since `pcp_listen_addresses='*'`)
+5. **Pre-flight:** If pgpool marks this node down but backend is up, runs `pcp_attach_node` first (idempotent)
+
+Also reduced `sr_check_period` from 10s → 3s in `04_Configure_Pgpool.yml` as a safety net (bounds the residual window; overhead: 1 trivial query/backend/3s — negligible).
+
+### 12.7 What About "All Hosts Down"?
+
+No HA topology survives every node dying at once — that is disaster recovery, not high availability. Documented restore path: bring etcd up first (members with `initial-cluster-state: existing`), then Patroni on one node, then the rest — or restore from pgBackRest if data is unrecoverable. The fixes above buy you: **losing any single host** (or two, with 5-node etcd) with **no total outage**.
+
+### 12.8 Named Architectural Finding: DCS is a Single Point of Failure for Write Availability
 
 > **Finding (confirmed by Test 3 — mixed/cascading failure, 2026-08-11):**
-> **etcd is a single point of failure for *write availability* in this
-> architecture.** During Test 3, two of three PostgreSQL nodes were fully
-> healthy throughout, and yet **all writes stopped completely** because the
-> etcd cluster lost quorum (one member killed + 30% packet loss between the
-> two survivors made a 2-of-3 quorum unreachable). The cluster correctly
-> chose **safe-unavailable** (zero primaries, read-only, no split-brain, no
-> data loss — 53/53 confirmed writes survived), but the outcome stands: a
-> healthy database cannot accept writes without a healthy DCS.
+> **etcd is a single point of failure for *write availability* in this architecture.** During Test 3, two of three PostgreSQL nodes were fully healthy throughout, and yet **all writes stopped completely** because the etcd cluster lost quorum (one member killed + 30% packet loss between the two survivors made a 2-of-3 quorum unreachable). The cluster correctly chose **safe-unavailable** (zero primaries, read-only, no split-brain, no data loss — 53/53 confirmed writes survived), but the outcome stands: a healthy database cannot accept writes without a healthy DCS.
 >
-> **Implication:** DCS availability is the upper bound on write availability.
-> Any failure that degrades etcd quorum — even while every Postgres node is
-> healthy — takes the entire cluster read-only.
+> **Implication:** DCS availability is the upper bound on write availability. Any failure that degrades etcd quorum — even while every Postgres node is healthy — takes the entire cluster read-only.
 >
-> **Proposed mitigation (cross-ref §12.1):** decouple the DCS failure domain
-> from the database failure domain so a DB-host problem cannot take quorum
-> down with it. Concrete options, in increasing order of cost:
-> 1. **Dedicated etcd witness nodes** (`etcd_group: "etcd_nodes"`) — etcd no
->    longer co-locates with Postgres, so a DB host crash never touches quorum
->    (§12.1).
-> 2. **5-node etcd topology** — tolerates two concurrent etcd losses,
->    end-to-end, instead of one.
-> 3. Combination of the above (dedicated witnesses *and* 5 members) for the
->    strongest separation.
+> **Proposed mitigation (cross-ref §12.1):** decouple the DCS failure domain from the database failure domain so a DB-host problem cannot take quorum down with it. Concrete options, in increasing order of cost:
+> 1. **Dedicated etcd witness nodes** (`etcd_group: "etcd_nodes"`) — etcd no longer co-locates with Postgres, so a DB host crash never touches quorum (§12.1).
+> 2. **5-node etcd topology** — tolerates two concurrent etcd losses, end-to-end, instead of one.
+> 3. Combination of the above (dedicated witnesses *and* 5 members) for the strongest separation.
 >
-> This is an architectural recommendation for a follow-up decision — **not a
-> blocker** for the current single-host-loss HA guarantees, which are
-> unaffected.
+> This is an architectural recommendation for a follow-up decision — **not a blocker** for the current single-host-loss HA guarantees, which are unaffected.
 
-### 12.8 Known Non-Blockers (follow-up, not required for HA acceptance)
+### 12.9 Known Non-Blockers (follow-up, not required for HA acceptance)
 
 | Item | Status | Action |
 |------|--------|--------|
