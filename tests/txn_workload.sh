@@ -32,12 +32,28 @@ VIP="${VIP:-192.168.122.200}"
 PORT="${PORT:-9999}"
 DB="${DB:-postgres}"
 USER="${PGADMIN_USER:-pgpool_admin}"
-PSQL="/usr/pgsql-16/bin/psql"
+# psql path differs by distro: RHEL ships /usr/pgsql-16/bin/psql, Debian/Ubuntu
+# ships /usr/bin/psql (pg_wrapper). Allow explicit override via PSQL env.
+if [ -n "${PSQL:-}" ]; then
+    :
+elif [ -x /usr/pgsql-16/bin/psql ]; then
+    PSQL="/usr/pgsql-16/bin/psql"
+elif [ -x /usr/bin/psql ]; then
+    PSQL="/usr/bin/psql"
+else
+    PSQL="psql"
+fi
 
 # Credential fallback: if PGPASSWORD/PGPASSFILE are not set, source the
 # working pgpool_admin password from the local pool_passwd (never printed).
-if [ -z "${PGPASSWORD:-}" ] && [ -z "${PGPASSFILE:-}" ] && [ -f /etc/pgpool-II/pool_passwd ]; then
-    export PGPASSWORD=$(grep "^pgpool_admin:" /etc/pgpool-II/pool_passwd | cut -d: -f2)
+# Path differs by distro: /etc/pgpool-II (RHEL) vs /etc/pgpool2 (Debian).
+if [ -z "${PGPASSWORD:-}" ] && [ -z "${PGPASSFILE:-}" ]; then
+    for PF in /etc/pgpool-II/pool_passwd /etc/pgpool2/pool_passwd; do
+        if [ -f "$PF" ]; then
+            export PGPASSWORD=$(grep "^pgpool_admin:" "$PF" | cut -d: -f2)
+            break
+        fi
+    done
 fi
 # Hard connection timeout: if the primary/VIP is down or the node is destroyed,
 # fail FAST (5s) instead of hanging for minutes on an in-flight connect.

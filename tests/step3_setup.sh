@@ -38,7 +38,8 @@ echo "=== STEP 3 SETUP + PRE-FAILURE BASELINE $TS ===" | tee -a "$OUT"
 
 # ---------- 1. Create tracking table (on leader via local psql) ----------
 echo "--- 1. Tracking table ---" | tee -a "$OUT"
-ssh_node "$LEADER_IP" "export PGPASSWORD=\$(grep '^pgpool_admin:' /etc/pgpool-II/pool_passwd | cut -d: -f2); /usr/pgsql-16/bin/psql -h $VIP -p $PORT -U $USER -d $DB -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS txn_track (id BIGINT PRIMARY KEY, client TEXT NOT NULL, ts TIMESTAMPTZ NOT NULL DEFAULT now());' -c 'SELECT count(*) FROM txn_track;'" 2>&1 | tee -a "$OUT"
+# pool_passwd path differs by distro: /etc/pgpool2 (Debian) vs /etc/pgpool-II (RHEL)
+ssh_node "$LEADER_IP" "PW_FILE=/etc/pgpool2/pool_passwd; [ -f \$PW_FILE ] || PW_FILE=/etc/pgpool-II/pool_passwd; export PGPASSWORD=\$(grep '^pgpool_admin:' \$PW_FILE | cut -d: -f2); /usr/bin/psql -h $VIP -p $PORT -U $USER -d $DB -v ON_ERROR_STOP=1 -c 'CREATE TABLE IF NOT EXISTS txn_track (id BIGINT PRIMARY KEY, client TEXT NOT NULL, ts TIMESTAMPTZ NOT NULL DEFAULT now());' -c 'SELECT count(*) FROM txn_track;'" 2>&1 | tee -a "$OUT"
 
 # ---------- 2. Validate presence on every node ----------
 echo "--- 2. Replication validation ---" | tee -a "$OUT"
@@ -54,7 +55,7 @@ done
 echo "--- 3. Baseline snapshot ---" | tee -a "$OUT"
 
 echo "[3a] Tracking table max(id) + count (through VIP):" | tee -a "$OUT"
-ssh_node "$LEADER_IP" "export PGPASSWORD=\$(grep '^pgpool_admin:' /etc/pgpool-II/pool_passwd | cut -d: -f2); /usr/pgsql-16/bin/psql -h $VIP -p $PORT -U $USER -d $DB -tA -c 'SELECT COALESCE(MAX(id),0), COUNT(*) FROM txn_track;'" 2>&1 | tee -a "$OUT"
+ssh_node "$LEADER_IP" "PW_FILE=/etc/pgpool2/pool_passwd; [ -f \$PW_FILE ] || PW_FILE=/etc/pgpool-II/pool_passwd; export PGPASSWORD=\$(grep '^pgpool_admin:' \$PW_FILE | cut -d: -f2); /usr/bin/psql -h $VIP -p $PORT -U $USER -d $DB -tA -c 'SELECT COALESCE(MAX(id),0), COUNT(*) FROM txn_track;'" 2>&1 | tee -a "$OUT"
 
 echo "[3a] Postgres committed xid on leader (pg_current_xact_id):" | tee -a "$OUT"
 ssh_node "$LEADER_IP" "su - postgres -c \"psql -tAc 'SELECT pg_current_xact_id();'\"" 2>&1 | tee -a "$OUT"
