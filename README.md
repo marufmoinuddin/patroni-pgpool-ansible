@@ -318,14 +318,14 @@ When `systemctl start patroni` runs:
 ### How the First PostgreSQL Node Becomes Primary (Bootstrap)
 
 1. Patroni starts on db1
-2. Reads `patroni.yml` → `scope: "kyc"`, `bootstrap.method: initdb`
+2. Reads `patroni.yml` → `scope: "maruf"`, `bootstrap.method: initdb`
 3. Connects to etcd → no existing cluster for this scope
 4. Patroni runs `initdb`:
    - Creates the data directory with encoding UTF8
    - Enables **data checksums** (detects corruption)
    - Sets auth method to `scram-sha-256`
    - Creates users: `postgres` (superuser), `replicator` (replication), `pgpool` (monitoring), `admin` (management)
-5. Patroni writes the initial cluster state to etcd (`/percona_lab/kyc/leader`, `.../members/db1`, `.../config`, `.../history`)
+5. Patroni writes the initial cluster state to etcd (`/percona_lab/maruf/leader`, `.../members/db1`, `.../config`, `.../history`)
 6. Patroni starts PostgreSQL as **PRIMARY**
 7. Patroni begins heartbeating the leader lock (renews TTL every `loop_wait` seconds)
 
@@ -339,17 +339,17 @@ When `systemctl start patroni` runs:
    - Streams base backup + WAL to the local data directory
    - Creates `standby.signal` (tells PostgreSQL to start as a replica)
 5. Patroni starts PostgreSQL as **REPLICA**
-6. Patroni registers in etcd: `/percona_lab/kyc/members/db2` → `{role: "replica"}`
+6. Patroni registers in etcd: `/percona_lab/maruf/members/db2` → `{role: "replica"}`
 7. Patroni begins streaming replication from the primary
 
 ### How Patroni Communicates with etcd
 
 | Operation | etcd Key | Purpose |
 |-----------|----------|---------|
-| Leader lock | `/percona_lab/kyc/leader` | Key with TTL; only the leader can write it |
-| Member registration | `/percona_lab/kyc/members/<name>` | Node metadata, role, state, timeline |
-| Cluster config | `/percona_lab/kyc/config` | PostgreSQL parameters (dynamic) |
-| Timeline history | `/percona_lab/kyc/history` | Used by `pg_rewind` after failover |
+| Leader lock | `/percona_lab/maruf/leader` | Key with TTL; only the leader can write it |
+| Member registration | `/percona_lab/maruf/members/<name>` | Node metadata, role, state, timeline |
+| Cluster config | `/percona_lab/maruf/config` | PostgreSQL parameters (dynamic) |
+| Timeline history | `/percona_lab/maruf/history` | Used by `pg_rewind` after failover |
 | Watches | All keys above | Instant notification of changes |
 
 **Heartbeat loop** (runs every `loop_wait` seconds, default 10s):
@@ -593,7 +593,7 @@ patroni-pgpool-ansible/
 | 02 | `02_Configure_Etcd.yml` | Writes the etcd config on all 3 nodes, **wipes stale etcd data** (so a re-run bootstraps cleanly), starts etcd, and verifies quorum. |
 | 03 | `03_Configure_Patroni.yml` | Creates the PostgreSQL data directory, writes `patroni.yml` (the full HA config with pgtune-calculated parameters, watchdog, callbacks), installs the systemd unit with `ExecStartPre` waiting for etcd, **starts the primary first**, waits, then starts replicas — then verifies with `patronictl list`. |
 | 04 | `04_Configure_Pgpool.yml` | Writes `pgpool.conf` + **OS-conditional watchdog config** (CentOS: separate `pgpool_watchdog.conf` with 4.7 params; Debian: inline in `pgpool.conf` with legacy 4.3.5 params), `pool_hba.conf` + `pool_passwd` (plaintext for SCRAM) + `pcp.conf`, deploys Patroni-aware `failover.sh` / `follow_master.sh`, sets `pgpool_node_id`, and starts the watchdog cluster so the VIP is claimed. **Auto-detects VIP interface** (`eth0` on CentOS, `enp3s0` on Debian). |
-| 05 | `05_Configure_Pgbackrest.yml` | Installs/connects pgBackRest on the backup node, exchanges SSH keys with all PG nodes (using `StrictHostKeyChecking accept-new` for non-interactive automation), writes `pgbackrest.conf` with stanza `kyc`, and prints the exact commands to create the stanza + first backup. |
+| 05 | `05_Configure_Pgbackrest.yml` | Installs/connects pgBackRest on the backup node, exchanges SSH keys with all PG nodes (using `StrictHostKeyChecking accept-new` for non-interactive automation), writes `pgbackrest.conf` with stanza `maruf`, and prints the exact commands to create the stanza + first backup. |
 | 06 | `06_Install_Pmm_Monitoring.yml` | Pulls and runs the PMM Server Docker container on the backup node (cleans stale `pmm-data` volume first), opens the firewall for it, installs PMM Client on all 3 PG nodes (skips `pg_stat_monitor` on Debian where the package doesn't exist), and registers them with the server. |
 | 07 | `07_Configure_Cluster_Health.yml` | Deploys two systemd timers: `patroni-self-heal.timer` (30s, restarts crashed local Patroni member) and `cluster-health.timer` (60s, checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence). Logs to `/var/log/patroni/cluster_health.log`, writes Prometheus textfile metrics for PMM's node_exporter, fires `health_alert_command` on CRITICAL. Also deploys durable event log (`leader_events.log`) and monotonic Prometheus counters for every leader election, read-only leader event, and etcd quorum loss. |
 | 08 | `08_Configure_Switchover_Signal.yml` | Deploys `pgpool_role_signal.sh` as Patroni's `on_role_change` callback. On promotion to primary, it confirms via `patronictl` that THIS node holds the DCS leader lease, maps the local IP to a pgpool backend node_id, and runs `pcp_promote_node` on ALL pgpool nodes (including the VIP-holding watchdog leader) — eliminating the ~4-minute polling gap observed on clean switchover. |
@@ -602,15 +602,15 @@ patroni-pgpool-ansible/
 
 | Setting | Value |
 |---------|-------|
-| Cluster scope (PostgreSQL name) | `kyc` |
+| Cluster scope (PostgreSQL name) | `maruf` |
 | Patroni namespace | `percona_lab` |
 | PostgreSQL version | 16 |
-| Data directory | `/postgres/data/16/kyc` |
+| Data directory | `/postgres/data/16/maruf` |
 | etcd token | `PostgreSQL_HA_Cluster_1` |
 | etcd data directory | `/var/lib/etcd` |
 | **Floating VIP** | **`192.168.122.200`** on port **9999** |
 | VIP network interface | `eth0` (change if your NIC differs) |
-| pgBackRest stanza | `kyc`, repo at `/postgres/pgbackup` |
+| pgBackRest stanza | `maruf`, repo at `/postgres/pgbackup` |
 | PMM Server URL | `https://192.168.122.153:443` |
 | Patroni REST API | `:8008` on every node |
 | PCP port / user | `9898` / `pgpool_pcp` |
@@ -689,7 +689,7 @@ ansible-vault encrypt variables.yaml
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `patroni_scope` | Cluster name | `kyc` |
+| `patroni_scope` | Cluster name | `maruf` |
 | `postgres_password` | PostgreSQL superuser password | **strong random** |
 | `replicator_password` | Replication user password | **strong random** |
 | `patroni_admin_password` | Patroni REST API admin | **strong random** |
@@ -746,9 +746,9 @@ ansible-playbook -i hosts site.yml
 
 5. **Create the pgBackRest stanza + first backup** (the playbook prints these, by design — they're intentionally manual so *you* decide when to take the first backup):
    ```bash
-   sudo -iu postgres pgbackrest --stanza=kyc stanza-create
-   sudo -iu postgres pgbackrest --stanza=kyc --type=full backup
-   sudo -iu postgres pgbackrest --stanza=kyc info
+   sudo -iu postgres pgbackrest --stanza=maruf stanza-create
+   sudo -iu postgres pgbackrest --stanza=maruf --type=full backup
+   sudo -iu postgres pgbackrest --stanza=maruf info
    ```
 
 6. **Log into PMM:**
@@ -778,7 +778,7 @@ Prefer to see every screw and bolt? This section walks through exactly what the 
 |------|-------------------------|-----------------------------------|
 | Package manager | `dnf` | `apt` (with `apt update`) |
 | Percona repo | RPM + `percona-release setup ppg-16` | `.deb` + `percona-release setup ppg-16` |
-| PostgreSQL data dir | `/var/lib/pgsql/16/data/kyc` | `/postgres/data/16/kyc` |
+| PostgreSQL data dir | `/var/lib/pgsql/16/data/maruf` | `/postgres/data/16/maruf` |
 | PostgreSQL bin dir | `/usr/pgsql-16/bin` | `/usr/lib/postgresql/16/bin` |
 | PostgreSQL service | `postgresql-16` (systemd) | `postgresql` (via `pg_ctlcluster`) |
 | Patroni binary | `/usr/bin/patroni` | `/bin/patroni` |
@@ -962,7 +962,7 @@ Create `/etc/patroni/patroni.yml` on **each** node. The structure is the same ev
 ```yaml
 # /etc/patroni/patroni.yml  (db1 example)
 namespace: percona_lab
-scope: kyc
+scope: maruf
 name: db1                       # db2 / db3 on the other nodes
 
 restapi:
@@ -992,7 +992,7 @@ bootstrap:
         max_wal_size: '10GB'
         archive_mode: "on"
         archive_timeout: 600s
-        archive_command: "cp -f %p /postgres/pgbackup/kyc/archive/%f"
+        archive_command: "cp -f %p /postgres/pgbackup/maruf/archive/%f"
 
   initdb:
     - encoding: UTF8
@@ -1025,7 +1025,7 @@ postgresql:
   cluster_name: cluster_1
   listen: 0.0.0.0:5432
   connect_address: 192.168.122.150:5432   # this node's IP
-  data_dir: /postgres/data/16/kyc         # DEBIAN PATH — change for RHEL below
+  data_dir: /postgres/data/16/maruf         # DEBIAN PATH — change for RHEL below
   bin_dir: /usr/lib/postgresql/16/bin      # DEBIAN PATH — change for RHEL below
   pgpass: /tmp/pgpass0
   authentication:
@@ -1050,8 +1050,8 @@ tags:
 ```
 
 > 📋 **Path differences for `patroni.yml`:**
-> - **RHEL/CentOS:** `data_dir: /var/lib/pgsql/16/data/kyc`, `bin_dir: /usr/pgsql-16/bin`
-> - **Debian/Ubuntu:** `data_dir: /postgres/data/16/kyc`, `bin_dir: /usr/lib/postgresql/16/bin`
+> - **RHEL/CentOS:** `data_dir: /var/lib/pgsql/16/data/maruf`, `bin_dir: /usr/pgsql-16/bin`
+> - **Debian/Ubuntu:** `data_dir: /postgres/data/16/maruf`, `bin_dir: /usr/lib/postgresql/16/bin`
 
 #### Initialize PostgreSQL + systemd unit
 
@@ -1094,10 +1094,10 @@ mkdir -p /postgres/data/16 /etc/patroni
 chown -R postgres:postgres /postgres
 
 # On PRIMARY (db1) only:
-pg_createcluster 16 kyc -d /postgres/data/16/kyc
+pg_createcluster 16 maruf -d /postgres/data/16/maruf
 
 # Stop it so Patroni can take over
-pg_ctlcluster 16 kyc stop
+pg_ctlcluster 16 maruf stop
 
 # systemd unit (Patroni binary at /bin/patroni)
 cat > /etc/systemd/system/patroni.service <<'EOF'
@@ -1164,19 +1164,19 @@ socket_dir = '/var/run/pgpool'
 backend_hostname0 = '192.168.122.150'
 backend_port0 = 5432
 backend_weight0 = 1
-backend_data_directory0 = '/var/lib/pgsql/16/data/kyc'   # RHEL PATH
+backend_data_directory0 = '/var/lib/pgsql/16/data/maruf'   # RHEL PATH
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 
 backend_hostname1 = '192.168.122.151'
 backend_port1 = 5432
 backend_weight1 = 1
-backend_data_directory1 = '/var/lib/pgsql/16/data/kyc'   # RHEL PATH
+backend_data_directory1 = '/var/lib/pgsql/16/data/maruf'   # RHEL PATH
 backend_flag1 = 'ALLOW_TO_FAILOVER'
 
 backend_hostname2 = '192.168.122.152'
 backend_port2 = 5432
 backend_weight2 = 1
-backend_data_directory2 = '/var/lib/pgsql/16/data/kyc'   # RHEL PATH
+backend_data_directory2 = '/var/lib/pgsql/16/data/maruf'   # RHEL PATH
 backend_flag2 = 'ALLOW_TO_FAILOVER'
 
 # Health checks
@@ -1244,19 +1244,19 @@ socket_dir = '/var/run/pgpool'
 backend_hostname0 = '192.168.122.150'
 backend_port0 = 5432
 backend_weight0 = 1
-backend_data_directory0 = '/postgres/data/16/kyc'   # DEBIAN PATH
+backend_data_directory0 = '/postgres/data/16/maruf'   # DEBIAN PATH
 backend_flag0 = 'ALLOW_TO_FAILOVER'
 
 backend_hostname1 = '192.168.122.151'
 backend_port1 = 5432
 backend_weight1 = 1
-backend_data_directory1 = '/postgres/data/16/kyc'   # DEBIAN PATH
+backend_data_directory1 = '/postgres/data/16/maruf'   # DEBIAN PATH
 backend_flag1 = 'ALLOW_TO_FAILOVER'
 
 backend_hostname2 = '192.168.122.152'
 backend_port2 = 5432
 backend_weight2 = 1
-backend_data_directory2 = '/postgres/data/16/kyc'   # DEBIAN PATH
+backend_data_directory2 = '/postgres/data/16/maruf'   # DEBIAN PATH
 backend_flag2 = 'ALLOW_TO_FAILOVER'
 
 # Health checks
@@ -1419,9 +1419,9 @@ cat > /etc/pgbackrest.conf <<'EOF'
 repo1-path = /postgres/pgbackup
 repo1-retention-full = 2
 
-[kyc]
+[maruf]
 pg1-host = 192.168.122.150
-pg1-path = /postgres/data/16/kyc      # DEBIAN PATH — change for RHEL
+pg1-path = /postgres/data/16/maruf      # DEBIAN PATH — change for RHEL
 pg1-port = 5432
 EOF
 
@@ -1431,23 +1431,23 @@ cat > /etc/pgbackrest.conf <<'EOF'
 repo1-host = 192.168.122.153
 repo1-path = /postgres/pgbackup
 
-[kyc]
-pg1-path = /postgres/data/16/kyc      # DEBIAN PATH — change for RHEL
+[maruf]
+pg1-path = /postgres/data/16/maruf      # DEBIAN PATH — change for RHEL
 EOF
 ```
 
 > 📋 **pgBackRest `pg1-path` values:**
-> - **RHEL/CentOS:** `/var/lib/pgsql/16/data/kyc`
-> - **Debian/Ubuntu:** `/postgres/data/16/kyc`
+> - **RHEL/CentOS:** `/var/lib/pgsql/16/data/maruf`
+> - **Debian/Ubuntu:** `/postgres/data/16/maruf`
 
 ```bash
 # Create the stanza, then the first full backup (on the backup node)
-sudo -iu postgres pgbackrest --stanza=kyc stanza-create
-sudo -iu postgres pgbackrest --stanza=kyc --type=full backup
-sudo -iu postgres pgbackrest --stanza=kyc info
+sudo -iu postgres pgbackrest --stanza=maruf stanza-create
+sudo -iu postgres pgbackrest --stanza=maruf --type=full backup
+sudo -iu postgres pgbackrest --stanza=maruf info
 ```
 
-> The `archive_command` in Patroni (Phase 3) sends WAL to `/postgres/pgbackup/kyc/archive/` — pgBackRest picks it up from there. Archiving must be enabled **before** the first backup for a complete PITR chain.
+> The `archive_command` in Patroni (Phase 3) sends WAL to `/postgres/pgbackup/maruf/archive/` — pgBackRest picks it up from there. Archiving must be enabled **before** the first backup for a complete PITR chain.
 
 ---
 
@@ -1534,7 +1534,7 @@ patronictl -c /etc/patroni/patroni.yml show-config
 patronictl -c /etc/patroni/patroni.yml switchover
 
 # Restart a node's PostgreSQL (rolling, Patroni-aware)
-patronictl -c /etc/patroni/patroni.yml restart kyc
+patronictl -c /etc/patroni/patroni.yml restart maruf
 
 # Failover NOW (promote a specific replica)
 patronictl -c /etc/patroni/patroni.yml failover
@@ -1559,11 +1559,11 @@ ETCDCTL_API=3 etcdctl --endpoints=http://192.168.122.150:2379 member list
 
 # Inspect Patroni keys
 ETCDCTL_API=3 etcdctl --endpoints=http://192.168.122.150:2379 \
-  get /percona_lab/kyc --prefix
+  get /percona_lab/maruf --prefix
 
 # Who is the current leader?
 ETCDCTL_API=3 etcdctl --endpoints=http://192.168.122.150:2379 \
-  get /percona_lab/kyc/leader
+  get /percona_lab/maruf/leader
 ```
 
 ### pgpool-II
@@ -1590,16 +1590,16 @@ journalctl -u pgpool -f
 
 ```bash
 # Backup info
-sudo -iu postgres pgbackrest --stanza=kyc info
+sudo -iu postgres pgbackrest --stanza=maruf info
 
 # Full backup
-sudo -iu postgres pgbackrest --stanza=kyc --type=full backup
+sudo -iu postgres pgbackrest --stanza=maruf --type=full backup
 
 # Incremental backup
-sudo -iu postgres pgbackrest --stanza=kyc --type=incr backup
+sudo -iu postgres pgbackrest --stanza=maruf --type=incr backup
 
 # Restore to a point in time (example)
-sudo -iu postgres pgbackrest --stanza=kyc --type=time \
+sudo -iu postgres pgbackrest --stanza=maruf --type=time \
   --target="2026-08-07 12:00:00" restore
 ```
 
@@ -1687,7 +1687,7 @@ To use dedicated witnesses: add an `[etcd_nodes]` group (odd member count) to `h
 
 | Timer | Interval | What it does |
 |-------|----------|--------------|
-| `patroni-self-heal.timer` | 30s | Restarts a **crashed/stopped/failed local** Patroni member. Never touches the leader. Remote crashed members are logged + alerted (manual `patronictl reinit kyc <member>` for corrupt data dirs) |
+| `patroni-self-heal.timer` | 30s | Restarts a **crashed/stopped/failed local** Patroni member. Never touches the leader. Remote crashed members are logged + alerted (manual `patronictl reinit maruf <member>` for corrupt data dirs) |
 | `cluster-health.timer` | 60s | Checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence. Logs to `/var/log/patroni/cluster_health.log`, writes Prometheus textfile metrics for PMM, fires `health_alert_command` on CRITICAL |
 
 Metrics exposed (scraped by PMM's node_exporter textfile collector):
@@ -1744,7 +1744,7 @@ No HA topology survives every node dying at once — that is disaster recovery, 
 | **Patroni won't start** | etcd not reachable | `systemctl status etcd`, `ETCDCTL_API=3 etcdctl endpoint health`; check `patroni.yml` `etcd3.hosts` (all endpoints are listed now). `ExecStartPre` waits `etcd_wait_timeout` (90s) before giving up |
 | **etcd quorum not forming** | Stale data from a previous run | On a FRESH bootstrap only: set `etcd_force_reset: true` in variables.yaml and re-run 02 (it wipes + sets `initial-cluster-state: new`). Never `rm -rf /var/lib/etcd/*` on a healthy cluster |
 | **No leader after 2 hosts down** | Expected: 3-node etcd needs a 2/3 majority | That's consensus working correctly. For higher tolerance use `etcd_group: "etcd_nodes"` with 3–5 dedicated witnesses (see §12.1) |
-| **Crashed replica won't recover** | Corrupt data dir or DCS hiccup | `patroni-self-heal.timer` restarts a crashed LOCAL member automatically; for a corrupt data dir run `patronictl -c /etc/patroni/patroni.yml reinit kyc <member>` manually (never auto-reinit) |
+| **Crashed replica won't recover** | Corrupt data dir or DCS hiccup | `patroni-self-heal.timer` restarts a crashed LOCAL member automatically; for a corrupt data dir run `patronictl -c /etc/patroni/patroni.yml reinit maruf <member>` manually (never auto-reinit) |
 | **Patroni won't start after reboot** | Patroni raced etcd at boot | `ExecStartPre=/usr/local/sbin/wait_for_etcd.sh` waits for DCS; check `journalctl -u patroni` and `/var/log/patroni/cluster_health.log` |
 | **etcd member fails GPG validation** | Fresh OS missing Percona keys | The RPM installs its own key; the playbook uses `disable_gpg_check: true` for the release RPM |
 | **Replicas stuck with lag** | Replication slot missing / WAL removed | `patronictl -c /etc/patroni/patroni.yml list`; check `pg_replication_slots`; a full `pg_basebackup` may be needed |
@@ -1754,9 +1754,9 @@ No HA topology survives every node dying at once — that is disaster recovery, 
 | **Debian installs wrong pgpool** | Percona repo pulls pgpool-II 4.7 libs | Debian MUST use native `pgpool2` 4.3.5: purge `percona-release`/`postgresql-client-common`/`libpgpool2`, `dpkg --configure -a && apt-get -f install`, install native `pgpool2` BEFORE enabling the Percona repo, then `apt-mark hold pgpool2` / pin `4.3.5*` |
 | **Cannot connect via VIP** | VIP on wrong node / pgpool not started | `ip addr` (who owns .200?), `pcp_watchdog_info`, `systemctl status pgpool` |
 | **pool_passwd auth fails** | MD5 vs SCRAM mismatch | This repo uses a plaintext `pool_passwd` + `pool_hba.conf` (SCRAM-safe); keep file perms 600 |
-| **pgBackRest fails** | SSH keys / stanza missing | Run `stanza-create` first; `sudo -iu postgres pgbackrest --stanza=kyc info`; check `repo1-host` |
+| **pgBackRest fails** | SSH keys / stanza missing | Run `stanza-create` first; `sudo -iu postgres pgbackrest --stanza=maruf info`; check `repo1-host` |
 | **PMM not reachable** | Docker port mapping / firewall | Image listens on 8443 internally → map `-p 443:8443`; open 443 on backup node; iptables FORWARD ACCEPT for 443 |
-| **`patronictl restart` hangs** | Interactive prompt | Use `patronictl restart kyc --no-wait` (or `-w` to wait) — never run bare in automation |
+| **`patronictl restart` hangs** | Interactive prompt | Use `patronictl restart maruf --no-wait` (or `-w` to wait) — never run bare in automation |
 | **Deploy fails on a fresh VM** | Missing EPEL/CRB | `dnf install -y epel-release && dnf config-manager --set-enabled crb` before installing pgBackRest deps |
 
 ---
@@ -1798,12 +1798,12 @@ No HA topology survives every node dying at once — that is disaster recovery, 
 6. **Automate the first backup** — the playbook intentionally stops at printing the pgBackRest commands. In production, schedule:
    ```bash
    # cron on the backup node
-   0 1 * * * sudo -iu postgres pgbackrest --stanza=kyc --type=incr backup
+   0 1 * * * sudo -iu postgres pgbackrest --stanza=maruf --type=incr backup
    ```
 7. **Test failover monthly** — run the procedures in [docs/FAILOVER_TESTING.md](docs/FAILOVER_TESTING.md) on a schedule. A HA cluster you never test is a false promise.
 8. **Monitor the monitors** — PMM alerting should include: Patroni node down, etcd quorum lost, replica lag, backup age, VIP owner changes.
 9. **Keep the deployment reproducible** — the whole point of this repo: one `ansible-playbook` run rebuilds the world. Store your customized `hosts` + vars in Git (secrets in Vault).
-10. **Backup the etcd data too** — etcd holds the cluster brain (`/percona_lab/kyc/*`). A full backup strategy includes `etcdctl snapshot save`.
+10. **Backup the etcd data too** — etcd holds the cluster brain (`/percona_lab/maruf/*`). A full backup strategy includes `etcdctl snapshot save`.
 
 ---
 

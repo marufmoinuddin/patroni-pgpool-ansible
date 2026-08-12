@@ -7,17 +7,17 @@ expected to be failed, and is now **masked** by playbook 05).
 ## Commands that matter
 
 - Config: `/etc/pgbackrest.conf` (NOT `/etc/pgbackrest/pgbackrest.conf`)
-- Stanza: **`kyc`** (NOT `pg1`)
-- Data dir (per stanza): `/var/lib/pgsql/16/data/kyc` (workload database is `postgres`/`txn_track`)
+- Stanza: **`maruf`** (NOT `pg1`)
+- Data dir (per stanza): `/var/lib/pgsql/16/data/maruf` (workload database is `postgres`/`txn_track`)
 
 ## Check results (2026-08-12)
 
 ```
-$ pgbackrest --stanza=kyc --config=/etc/pgbackrest.conf check
+$ pgbackrest --stanza=maruf --config=/etc/pgbackrest.conf check
 P00 INFO: check command end: completed successfully (3140ms)
 ```
 
-- Stanza `kyc`: **ok**
+- Stanza `maruf`: **ok**
 - Full backup exists: `20260812-002436F` — db size 22.3MB, backup size 3MB
 - WAL archiving verified end-to-end: segment `00000007000000000000000F` switched on the leader and
   arrived in the repo on br1 over SSH (timeline 7 range being archived, min/max
@@ -26,8 +26,8 @@ P00 INFO: check command end: completed successfully (3140ms)
 ## Note for future runs
 
 - `pgbackrest --stanza=pg1 check` will fail with "stanza path missing" — that is the wrong stanza
-  name. Always use `--stanza=kyc`.
-- Run the check as the **postgres** user (`su - postgres -c "pgbackrest --config=/etc/pgbackrest.conf --stanza=kyc check"`).
+  name. Always use `--stanza=maruf`.
+- Run the check as the **postgres** user (`su - postgres -c "pgbackrest --config=/etc/pgbackrest.conf --stanza=maruf check"`).
   Running it as root produces `[255]: Host key verification failed` for every pg host because
   root has no `known_hosts` on br1 — a probe artifact, NOT a cluster fault. The postgres user's
   `~/.ssh/known_hosts` has all three db hosts pinned, and archiving runs as postgres (playbook 05).

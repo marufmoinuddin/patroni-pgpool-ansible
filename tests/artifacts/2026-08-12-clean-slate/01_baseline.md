@@ -10,7 +10,7 @@ Taken after `site.yml` completed, before any failure injection.
 | pool_nodes | 1 primary + 2 standby, all `up` |
 | VIP write (`txn_track` id=1) | ✅ |
 | pg_is_in_recovery | exactly one `f` (db1), db2/db3 `t` |
-| pgBackRest | stanza `kyc`, `pgbackrest check` OK, full backup present |
+| pgBackRest | stanza `maruf`, `pgbackrest check` OK, full backup present |
 
 ## Notes
 

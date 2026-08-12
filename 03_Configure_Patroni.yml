@@ -270,7 +270,7 @@
       loop:
         - { path: "{{ base_data_dir }}", mode: '0755' }
         - { path: "{{ data_dir }}", mode: '0700' }
-        - { path: "/postgres/pgbackup/kyc/archive", mode: '0700' }
+        - { path: "/postgres/pgbackup/{{ patroni_scope }}/archive", mode: '0700' }
         - { path: "/etc/patroni", mode: '0755' }
         - { path: "{{ pg_socket_dir }}", mode: '0755' }
         - { path: "/var/log/patroni", mode: '0755' }
@@ -423,8 +423,8 @@
                         # --- ARCHIVE ---
                         archive_mode: "on"
                         archive_timeout: 600s
-                        archive_command: "pgbackrest --stanza=kyc archive-push %p"
-                        restore_command: "timeout 60 pgbackrest --stanza=kyc archive-get %f %p"
+                        archive_command: "pgbackrest --stanza={{ patroni_scope }} archive-push %p"
+                        restore_command: "timeout 60 pgbackrest --stanza={{ patroni_scope }} archive-get %f %p"
 
             initdb:
                 - encoding: UTF8

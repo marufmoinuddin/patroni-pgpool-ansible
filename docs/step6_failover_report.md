@@ -24,7 +24,7 @@ Prove the HA stack self-heals correctly through **5 consecutive kill/recovery it
 | Recovery | `failover_test_harness.sh --targets <node> --action vm-start --execute` (cold boot, Patroni pg_rewind + WAL catch-up) |
 | Workload | `txn_workload.sh <id> 2400 <dir>` — INSERT into `txn_track`, 2400s continuous window (outage + recovery), **always seeds from fresh atomic `max(id)` query**; ≤3 retries on duplicate key then auto-RESYNC |
 | Observer | `step4_observer.sh <dir> 720 2 <pool-host>` — 720 × ~2s samples; per-node `pg_is_in_recovery()` + pool `SHOW pool_nodes` |
-| DB | `postgres` (workload default); `kyc` is the data-dir/schema dir name only |
+| DB | `postgres` (workload default); `maruf` is the data-dir/schema dir name only |
 
 ## 3. Results
 

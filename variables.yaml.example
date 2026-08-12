@@ -12,7 +12,7 @@
 # =============================================================================
 
 # --- Cluster Identity ---
-patroni_scope: "kyc"
+patroni_scope: "maruf"
 patroni_namespace: "percona_lab"
 # Alias used by the playbooks for the Patroni namespace prefix (keys under
 # /<namespace>/<scope>). Defaults to patroni_namespace.
@@ -58,7 +58,7 @@ pgpool_admin_user: "pgpool_admin"
 pgpool_admin_password: "CHANGE_ME_PGPOOL_ADMIN_PASSWORD"
 
 # --- pgBackRest ---
-pgbackrest_stanza: "kyc"
+pgbackrest_stanza: "maruf"
 pgbackrest_repo_path: "/postgres/pgbackup"
 
 # --- PMM (Percona Monitoring & Management) ---

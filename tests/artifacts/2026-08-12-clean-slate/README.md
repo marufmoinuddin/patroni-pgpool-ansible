@@ -28,7 +28,7 @@ It is distinct from the earlier incremental, hand-patched validation cycle:
 - `04_test_C_switchover.md` — clean planned switchover, single-digit-second blip
 - `05_test_D_writability_detection.md` — leader-writability checker live + blip smoke
 - `06_data_integrity.md` — final 11,066-row accounting, `comm -23` empty, pgbench
-- `07_pgbackrest_verification.md` — stanza `kyc` check, full backup, live WAL archiving
+- `07_pgbackrest_verification.md` — stanza `maruf` check, full backup, live WAL archiving
 - `08_final_state.md` — cluster at rest after the full suite
 
 ## Headline numbers

@@ -170,7 +170,7 @@
       loop:
         - /var/lib/pgsql/16
         - /var/lib/pgsql/16/data
-        - /var/lib/pgsql/16/data/kyc
+        - /var/lib/pgsql/16/data/{{ patroni_scope }}"
       ignore_errors: true
       when: ansible_os_family == "RedHat"
 

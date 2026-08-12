@@ -163,7 +163,7 @@
   become: true
   gather_facts: true
   vars:
-    scope: "kyc"
+    scope: "{{ patroni_scope }}"
   tasks:
     - name: Get Patroni cluster status
       shell: |

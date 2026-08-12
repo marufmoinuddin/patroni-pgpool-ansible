@@ -230,7 +230,7 @@
   hosts: pg_nodes
   become: true
   vars:
-    scope: "kyc"
+    scope: "{{ patroni_scope }}"
     pgversion: "16"
     data_dir: "{{ '/postgres/data/' ~ pgversion ~ '/' ~ scope if ansible_os_family == 'Debian' else '/var/lib/pgsql/' ~ pgversion ~ '/data/' ~ scope }}"
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
@@ -434,7 +434,7 @@
   hosts: pg_nodes[0]
   become: true
   vars:
-    scope: "kyc"
+    scope: "{{ patroni_scope }}"
     pgversion: "16"
     patroni_config_file: /etc/patroni/patroni.yml
     data_dir: "{{ '/postgres/data/' ~ pgversion ~ '/' ~ scope if ansible_os_family == 'Debian' else '/var/lib/pgsql/' ~ pgversion ~ '/data/' ~ scope }}"
@@ -543,7 +543,7 @@
   hosts: pg_backrest
   become: true
   vars:
-    scope: "kyc"
+    scope: "{{ patroni_scope }}"
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
   tasks:
     # pgBackRest connects OUT to each DB node; add all pg_node host keys to its known_hosts.

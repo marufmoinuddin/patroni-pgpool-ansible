@@ -2,7 +2,7 @@
 
 ## Workload accounting across all tests
 
-All writes go through the VIP to `txn_track` (database `postgres`, NOT `kyc`) using the
+All writes go through the VIP to `txn_track` (database `postgres`, NOT `maruf`) using the
 `txn_workload.sh` idempotent insert-returning pattern; confirmed IDs are logged per commit and
 compared against the table at rest.
 
