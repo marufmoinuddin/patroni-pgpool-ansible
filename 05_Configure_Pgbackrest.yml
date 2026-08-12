@@ -193,12 +193,27 @@
     # shipped (the top-of-play purge removes any stale one); masking the unit guarantees
     # it can never start, never shows as failed on monitoring, and stays that way on
     # re-runs regardless of any future unit file appearing.
-    - name: Mask unused pgBackRest server daemon (SSH archiving in use)
+    # NOTE (2026-08-12, Debian-family deploy): the RHEL package ships a real
+    # /usr/lib/systemd/system/pgbackrest.service (mask works), but the Debian
+    # percona-pgbackrest package ships NO unit at all — `systemd: masked: true`
+    # then fails with "Could not find the requested service pgbackrest".
+    # Guard the mask on the unit file existing; absence means it can never start.
+    - name: Check for pgBackRest server unit file (RHEL ships one, Debian does not)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/systemd/system/pgbackrest.service
+        - /usr/lib/systemd/system/pgbackrest.service
+        - /lib/systemd/system/pgbackrest.service
+      register: pgbackrest_unit_files
+
+    - name: Mask unused pgBackRest server daemon (only if a unit file exists)
       systemd:
         name: pgbackrest
         enabled: no
         state: stopped
         masked: true
+      when: pgbackrest_unit_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
 
     # Clear any historical failure state from pre-mask runs (upgrade path) so
     # monitoring sees only "masked", never "failed".
@@ -364,12 +379,27 @@
     # shipped (the top-of-play purge removes any stale one); masking the unit guarantees
     # it can never start, never shows as failed on monitoring, and stays that way on
     # re-runs regardless of any future unit file appearing.
-    - name: Mask unused pgBackRest server daemon (SSH archiving in use)
+    # NOTE (2026-08-12, Debian-family deploy): the RHEL package ships a real
+    # /usr/lib/systemd/system/pgbackrest.service (mask works), but the Debian
+    # percona-pgbackrest package ships NO unit at all — `systemd: masked: true`
+    # then fails with "Could not find the requested service pgbackrest".
+    # Guard the mask on the unit file existing; absence means it can never start.
+    - name: Check for pgBackRest server unit file (RHEL ships one, Debian does not)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/systemd/system/pgbackrest.service
+        - /usr/lib/systemd/system/pgbackrest.service
+        - /lib/systemd/system/pgbackrest.service
+      register: pgbackrest_unit_files
+
+    - name: Mask unused pgBackRest server daemon (only if a unit file exists)
       systemd:
         name: pgbackrest
         enabled: no
         state: stopped
         masked: true
+      when: pgbackrest_unit_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
 
     # Clear any historical failure state from pre-mask runs (upgrade path) so
     # monitoring sees only "masked", never "failed".
