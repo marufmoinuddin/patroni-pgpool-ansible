@@ -557,33 +557,38 @@ All nodes must resolve each other by hostname. Configure via `/etc/hosts` or int
 
 ## 7. What's Inside This Repository
 
-```
+``` 
 patroni-pgpool-ansible/
-├── site.yml                        ← Master playbook: runs 01→08 in order
+├── site.yml                        ← Master playbook: runs 01→05 + 07 (06 PMM is commented out by policy; 08 switchover signal must be run separately)
 ├── hosts.ini.example               ← Inventory template: 3 PG nodes + 1 backup (copy to hosts.ini)
 ├── ansible.cfg                     ← Ansible settings (root-based, no sudo prompts)
 ├── README.md                       ← This file
-├── 01_Install_Percona.yml          ← Repos, packages, prerequisites
+├── 01_Install_Percona.yml          ← Repos, packages, prerequisites (dual-distro)
 ├── 02_Configure_Etcd.yml           ← 3-node etcd cluster
-├── 03_Configure_Patroni.yml        ← PostgreSQL 16 + Patroni HA bootstrap
-├── 04_Configure_Pgpool.yml         ← pgpool-II 4.7/4.3.5 + Watchdog + VIP (OS-conditional)
+├── 03_Configure_Patroni.yml        ← PostgreSQL 16 + Patroni HA bootstrap (callbacks, ExecStartPre guard)
+├── 04_Configure_Pgpool.yml         ← pgpool-II 4.7/4.7(PGDG) + Watchdog + VIP (watchdog inline in pgpool.conf for both distros)
 ├── 05_Configure_Pgbackrest.yml     ← pgBackRest server + client integration
-├── 06_Install_Pmm_Monitoring.yml   ← PMM Server (Docker) + PMM Client
-├── 07_Configure_Cluster_Health.yml ← Self-healing timers + health monitor + Prometheus metrics
-├── 08_Configure_Switchover_Signal.yml ← Patroni on_role_change callback → pgpool active notification
+├── 06_Install_Pmm_Monitoring.yml   ← PMM Server (Docker) + PMM Client (DISABLED in site.yml by policy — see §12.8)
+├── 07_Configure_Cluster_Health.yml ← Self-healing timers + health monitor + Prometheus metrics + auto-reattach timer
+├── 08_Configure_Switchover_Signal.yml ← Patroni on_role_change callback → pgpool active notification (run separately after site.yml)
 ├── tests/                          ← Fault-injection harness (failover_test_harness.sh, step4_observer.sh, txn_workload.sh)
 ├── docs/                           ← Validation reports and procedures
 │   ├── FAILOVER_TESTING.md         ← How to run Tests 1-5
 │   └── step6_failover_report.md    ← 5/5 PASS evidence with timelines, durability, split-brain
 ├── files/                          ← Supporting scripts deployed by playbooks
-│   └── pgpool_role_signal.sh       ← Patroni callback for active switchover notification
-│                                     (reattach_nodes.sh, wait_for_etcd.sh, cluster_health.sh are
-│                                     deployed inline from their playbooks — see the design note below)
+│   ├── pgpool_role_signal.sh       ← Patroni on_role_change callback for active switchover notification
+│   ├── reattach_nodes.sh           ← (deployed inline from 04) auto-reattach timer for recovered backends + role correction
+│   ├── wait_for_etcd.sh            ← (deployed inline from 03) ExecStartPre guard for Patroni boot
+│   └── cluster_health.sh           ← (deployed inline from 07) 60s health check + Prometheus metrics
 ├── variables.yaml.example          ← All secrets + tunables (copy → variables.yaml, encrypt with ansible-vault)
 └── SKILLS.md                       ← Internal skill references for development
 ```
 
 > 💡 **Design choice:** every config file is written **inline** in the playbooks (via `copy: content: |`) — no `templates/` directory. This makes each playbook fully self-contained: you see the exact config being deployed without opening another file.
+
+> ⚠️ **PMM disabled by policy:** Playbook 06 is commented out in `site.yml` because the br1 host (2 vCPU) saturated under the combined ClickHouse/Grafana/VictoriaMetrics/PMM load and its sshd path wedged during Test 2. Do NOT re-enable without an explicit decision + br1 resize or metrics-stack split. See §12.8.
+
+> ⚠️ **08 must be run separately:** `08_Configure_Switchover_Signal.yml` is NOT included in `site.yml`. After the main deployment, run `ansible-playbook -i hosts 08_Configure_Switchover_Signal.yml` to deploy the `pgpool_role_signal.sh` callback that closes the ~4-minute clean-switchover detection gap. This is intentional: 08 is safe to run on a live cluster and can be added after the fact.
 
 ### Playbook Sequence
 
@@ -593,10 +598,10 @@ patroni-pgpool-ansible/
 | 02 | `02_Configure_Etcd.yml` | Writes the etcd config on all 3 nodes, **wipes stale etcd data** (so a re-run bootstraps cleanly), starts etcd, and verifies quorum. |
 | 03 | `03_Configure_Patroni.yml` | Creates the PostgreSQL data directory, writes `patroni.yml` (the full HA config with pgtune-calculated parameters, watchdog, callbacks), installs the systemd unit with `ExecStartPre` waiting for etcd, **starts the primary first**, waits, then starts replicas — then verifies with `patronictl list`. |
 | 04 | `04_Configure_Pgpool.yml` | Writes `pgpool.conf` + **OS-conditional watchdog config** (CentOS: separate `pgpool_watchdog.conf` with 4.7 params; Debian: inline in `pgpool.conf` with legacy 4.3.5 params), `pool_hba.conf` + `pool_passwd` (plaintext for SCRAM) + `pcp.conf`, deploys Patroni-aware `failover.sh` / `follow_master.sh`, sets `pgpool_node_id`, and starts the watchdog cluster so the VIP is claimed. **Auto-detects VIP interface** (`eth0` on CentOS, `enp3s0` on Debian). |
-| 05 | `05_Configure_Pgbackrest.yml` | Installs/connects pgBackRest on the backup node, exchanges SSH keys with all PG nodes (using `StrictHostKeyChecking accept-new` for non-interactive automation), writes `pgbackrest.conf` with stanza `kyc`, and prints the exact commands to create the stanza + first backup. |
-| 06 | `06_Install_Pmm_Monitoring.yml` | Pulls and runs the PMM Server Docker container on the backup node (cleans stale `pmm-data` volume first), opens the firewall for it, installs PMM Client on all 3 PG nodes (skips `pg_stat_monitor` on Debian where the package doesn't exist), and registers them with the server. |
-| 07 | `07_Configure_Cluster_Health.yml` | Deploys two systemd timers: `patroni-self-heal.timer` (30s, restarts crashed local Patroni member) and `cluster-health.timer` (60s, checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence). Logs to `/var/log/patroni/cluster_health.log`, writes Prometheus textfile metrics for PMM's node_exporter, fires `health_alert_command` on CRITICAL. Also deploys durable event log (`leader_events.log`) and monotonic Prometheus counters for every leader election, read-only leader event, and etcd quorum loss. |
-| 08 | `08_Configure_Switchover_Signal.yml` | Deploys `pgpool_role_signal.sh` as Patroni's `on_role_change` callback. On promotion to primary, it confirms via `patronictl` that THIS node holds the DCS leader lease, maps the local IP to a pgpool backend node_id, and runs `pcp_promote_node` on ALL pgpool nodes (including the VIP-holding watchdog leader) — eliminating the ~4-minute polling gap observed on clean switchover. |
+|| 05 | `05_Configure_Pgbackrest.yml` | Installs/connects pgBackRest on the backup node, exchanges SSH keys with all PG nodes (using `StrictHostKeyChecking accept-new` for non-interactive automation), writes `pgbackrest.conf` with stanza `kyc`, and prints the exact commands to create the stanza + first backup. | Idempotent |
+|| 06 | `06_Install_Pmm_Monitoring.yml` | Pulls and runs the PMM Server Docker container on the backup node (cleans stale `pmm-data` volume first), opens the firewall for it, installs PMM Client on all 3 PG nodes, and registers them with the server. | **DISABLED in site.yml by policy** — see §12.8 |
+|| 07 | `07_Configure_Cluster_Health.yml` | Deploys two systemd timers: `patroni-self-heal.timer` (30s, restarts crashed local Patroni member) and `cluster-health.timer` (60s, checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence). Also deploys the auto-reattach timer (`reattach_nodes.sh`) and durable event logging. | Always runs |
+|| 08 | `08_Configure_Switchover_Signal.yml` | Deploys `pgpool_role_signal.sh` as Patroni's `on_role_change` callback. On promotion to primary, it confirms via `patronictl` that THIS node holds the DCS leader lease, maps the local IP to a pgpool backend node_id, and runs `pcp_promote_node` on ALL pgpool nodes (including the VIP-holding watchdog leader) — eliminating the ~4-minute polling gap observed on clean switchover. | **Run separately AFTER site.yml** — safe on live cluster |
 
 ### Default Values You Should Know
 
@@ -717,7 +722,15 @@ ansible-playbook -i hosts site.yml --ask-vault-pass
 ansible-playbook -i hosts site.yml
 ```
 
-> ⏳ What you'll see: play 01 installs packages on all nodes (slowest), play 02 forms the etcd quorum, play 03 bootstraps PostgreSQL with Patroni (primary first, then replicas), play 04 starts the pgpool watchdog cluster, play 05 wires up pgBackRest, play 06 brings up PMM. **Green = done.**
+> ⏳ What you'll see: play 01 installs packages on all nodes (slowest), play 02 forms the etcd quorum, play 03 bootstraps PostgreSQL with Patroni (primary first, then replicas), play 04 starts the pgpool watchdog cluster, play 05 wires up pgBackRest, play 07 installs the health monitor and self-heal timers. **Green = done.**
+>
+> ⚠️ **PMM is NOT deployed by default** — play 06 is commented out in `site.yml` because the br1 host (2 vCPU) saturated under the combined ClickHouse/Grafana/VictoriaMetrics/PMM load and its sshd path wedged during Test 2. See §12.8.
+>
+> ⚠️ **Run 08 separately after this step** — `08_Configure_Switchover_Signal.yml` is intentionally excluded from `site.yml`. Once the cluster is green, deploy the switchover callback:
+> ```bash
+> ansible-playbook -i hosts 08_Configure_Switchover_Signal.yml
+> ```
+> This is safe on a live cluster and closes the ~4-minute clean-switchover detection gap.
 
 ### Step 5 — Post-Deployment Checklist
 
@@ -744,14 +757,20 @@ ansible-playbook -i hosts site.yml
    psql -h 192.168.122.200 -p 9999 -U postgres -d postgres -c "SELECT 1;"
    ```
 
-5. **Create the pgBackRest stanza + first backup** (the playbook prints these, by design — they're intentionally manual so *you* decide when to take the first backup):
+5. **Deploy the switchover callback (08 — closes the ~4-minute clean-switchover gap):**
+   ```bash
+   ansible-playbook -i hosts 08_Configure_Switchover_Signal.yml
+   ```
+   Verify it loaded: `grep callbacks /etc/patroni/patroni.yml` should show the `on_role_change` block.
+
+6. **Create the pgBackRest stanza + first backup** (the playbook prints these, by design — they're intentionally manual so *you* decide when to take the first backup):
    ```bash
    sudo -iu postgres pgbackrest --stanza=kyc stanza-create
    sudo -iu postgres pgbackrest --stanza=kyc --type=full backup
    sudo -iu postgres pgbackrest --stanza=kyc info
    ```
 
-6. **Log into PMM:**
+7. **Log into PMM (only if you re-enabled play 06):**
    - URL: `https://192.168.122.153:443`
    - User: `admin` / your chosen password
    - You should see 3 PostgreSQL nodes reporting metrics
@@ -765,6 +784,8 @@ ansible-playbook -i hosts site.yml
 ```
 
 Only play 02 wipes etcd data **by design** (it bootstraps a fresh cluster). If your cluster is already healthy and you re-run, Patroni will simply reconnect — **your data is safe**.
+
+> **Note:** `site.yml` runs plays 01→05 + 07. Play 06 (PMM) is commented out by policy. Play 08 (switchover signal) must be run separately and is safe to re-run at any time.
 
 ---
 
@@ -784,7 +805,7 @@ Prefer to see every screw and bolt? This section walks through exactly what the 
 | Patroni binary | `/usr/bin/patroni` | `/bin/patroni` |
 | **Pgpool config dir** | `/etc/pgpool-II` | `/etc/pgpool2` |
 | **Pgpool service name** | `pgpool` | `pgpool2` |
-| **Pgpool package** | `percona-pgpool-II-pg16` (4.7) | **native `pgpool2` (4.3.5)** — NOT `postgresql-16-pgpool2` |
+| **Pgpool package** | `percona-pgpool-II-pg16` (4.7) | **pgpool2 from PGDG 4.7.x** — NOT the old Debian native 4.3.5 |
 | Postgres user home | `/var/lib/pgsql` | `/var/lib/postgresql` |
 
 ---
@@ -853,38 +874,24 @@ dnf install -y \
 
 ```bash
 # 1. Install prerequisites
-apt update && apt install -y curl wget gnupg2
+apt update && apt install -y curl wget gnupg2 lsb-release
 
-# 2. Download and install Percona release .deb
-wget https://repo.percona.com/apt/percona-release_latest.generic_all.deb
-apt install -y ./percona-release_latest.generic_all.deb
-
-# 3. Enable the PostgreSQL 16 Percona repository
-percona-release setup ppg-16
-
-# 4. Install native pgpool2 FIRST (from Debian repo) to avoid Percona libpgpool2 conflict
-#    Then pin libpgpool2 to 4.3.5* so Percona's 4.7.0 doesn't upgrade it
+# 2. Add the PGDG repository (provides pgpool2 4.7.x)
+wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg
+echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
 apt update
-apt install -y pgpool2 libpgpool2=4.3.5-1+deb12u1
-# Pin the version (write before any Percona install)
-cat > /etc/apt/preferences.d/pgpool2 <<'EOF'
-Package: pgpool2
-Pin: version 4.3.5*
-Pin-Priority: 1001
 
-Package: libpgpool2
-Pin: version 4.3.5*
-Pin-Priority: 1001
-EOF
+# 3. Install pgpool2 4.7.x from PGDG (same version family as RHEL/Percona)
+apt install -y pgpool2
 
-# 5. Install the rest from Percona
+# 4. Install the rest from Percona
 apt install -y \
   percona-postgresql-16 \
   percona-patroni etcd \
   percona-pgbackrest
 ```
 
-> ⚠️ **Critical Debian pgpool2 note:** The Percona package `postgresql-16-pgpool2` is a **PostgreSQL 16 extension module only** (no pgpool daemon, no systemd unit, no `/etc/pgpool2` config dir). It also installs `libpgpool2=4.7.0` which **hard-conflicts** with native `pgpool2` 4.3.5's `libpgpool2=4.3.5`. **Use native `pgpool2` only** — do not install `postgresql-16-pgpool2`.
+> ✅ **Debian now uses pgpool2 4.7.x from PGDG**, matching the RHEL/Percona 4.7 package. Watchdog parameters, config directory (`/etc/pgpool2`), and service name (`pgpool2`) are the same as on RHEL. The old Debian native 4.3.5 pinning is no longer needed.
 
 ---
 
@@ -1150,13 +1157,15 @@ patronictl -c /etc/patroni/patroni.yml list
 The full `pgpool.conf` is long — here is the **watchdog-relevant essence** (per node; the `pgpool_node_id` file differs: `0`, `1`, `2`).
 
 > 📋 **Config directory and package version differences:**
-> - **RHEL/CentOS:** `/etc/pgpool-II`, pgpool-II 4.7 (Percona package), watchdog in **separate `pgpool_watchdog.conf`**
-> - **Debian/Ubuntu:** `/etc/pgpool2`, native `pgpool2` 4.3.5 (Debian repo), watchdog **inline in `pgpool.conf`** with legacy parameter names
+> - **RHEL/CentOS:** `/etc/pgpool-II`, pgpool-II 4.7 (Percona package), watchdog **inline in `pgpool.conf`**
+> - **Debian/Ubuntu:** `/etc/pgpool2`, pgpool2 4.7.x (PGDG repo), watchdog **inline in `pgpool.conf`**
+>
+> Both distros now use the **same pgpool2 4.7.x package family** and the same watchdog parameter names. The only config difference is the config directory path and `delegate_ip` vs `delegate_IP`.
 
-#### RHEL/CentOS (pgpool-II 4.7) — Separate Watchdog Config
+#### RHEL/CentOS (pgpool-II 4.7) — Watchdog Inline in pgpool.conf
 
 ```ini
-# pgpool.conf  (db1 example — key lines)
+# pgpool.conf  (db1 example — key lines, watchdog INLINE)
 listen_addresses = '*'
 port = 9999
 socket_dir = '/var/run/pgpool'
@@ -1195,45 +1204,48 @@ delay_threshold = 1048576
 pcp_listen_addresses = '*'
 pcp_port = 9898
 pcp_socket_dir = '/var/run/pgpool'
-```
 
-And the watchdog section in **separate `pgpool_watchdog.conf`** (4.7 parameter names):
-
-```ini
-# pgpool_watchdog.conf (db1 example)
+# Watchdog (INLINE in pgpool.conf — 4.7 parameter names)
 use_watchdog = on
+wd_lifecheck_method = heartbeat
+wd_monitoring_interfaces_list = 'eth0'
 
-wd_hostname = '192.168.122.150'
-wd_port = 9000
+# Watchdog nodes (indexed: 0,1,2 — must list ALL nodes)
+hostname0 = '192.168.122.150'
+wd_port0 = 9000
+pgpool_port0 = 9999
+hostname1 = '192.168.122.151'
+wd_port1 = 9000
+pgpool_port1 = 9999
+hostname2 = '192.168.122.152'
+wd_port2 = 9000
+pgpool_port2 = 9999
+
+# Local node priority + auth key
 wd_priority = 1
 wd_authkey = 'CHANGE_ME_WD_AUTH'
 
-# Watchdog peers — IMPORTANT: list ALL nodes on every node (4.7 requires indexed params)
-wd_hostname0 = '192.168.122.150'
-wd_port0 = 9000
-wd_hostname1 = '192.168.122.151'
-wd_port1 = 9000
-wd_hostname2 = '192.168.122.152'
-wd_port2 = 9000
+# Exit pgpool if the watchdog loses quorum (prevents split-brain VIP)
+wd_quorum_exit = on
 
-# Heartbeat (4.7 names: heartbeat_hostname, heartbeat_port, heartbeat_device)
-heartbeat_destination0 = '192.168.122.151'
+# Heartbeat lifecheck (4.7 names: heartbeat_hostname, heartbeat_port, heartbeat_device)
+heartbeat_hostname0 = '192.168.122.151'
 heartbeat_port0 = 9694
 heartbeat_device0 = 'eth0'
-heartbeat_destination1 = '192.168.122.152'
+heartbeat_hostname1 = '192.168.122.152'
 heartbeat_port1 = 9694
 heartbeat_device1 = 'eth0'
 
-# Virtual IP — only active on the watchdog leader
-vip = 1
-vip_ip = '192.168.122.200'
-vip_ifconfig = 'ifconfig eth0:0 192.168.122.200/24'
-vip_arping = 'arping -U -I eth0 -c 3 192.168.122.200'
-vip_cidr_prefix_length = 24
+# Virtual IP
 delegate_ip = '192.168.122.200'
+if_cmd_path = '/usr/sbin'
+if_up_cmd = '/usr/sbin/ip addr add 192.168.122.200/24 dev eth0 label eth0:pgpool'
+if_down_cmd = '/usr/sbin/ip addr del 192.168.122.200/24 dev eth0'
+arping_path = '/usr/sbin'
+arping_cmd = '/usr/sbin/arping -U 192.168.122.200 -w 1 -I eth0'
 ```
 
-#### Debian/Ubuntu (pgpool2 4.3.5) — Inline Watchdog Config
+#### Debian/Ubuntu (pgpool2 4.7.x from PGDG) — Watchdog Inline in pgpool.conf
 
 ```ini
 # pgpool.conf  (db1 example — key lines, watchdog INLINE)
@@ -1276,50 +1288,54 @@ pcp_listen_addresses = '*'
 pcp_port = 9898
 pcp_socket_dir = '/var/run/pgpool'
 
-# Watchdog (INLINE in pgpool.conf — 4.3.5 legacy parameter names)
+# Watchdog (INLINE in pgpool.conf — same 4.7 parameter names as RHEL)
 use_watchdog = on
-wd_lifecheck_method = 'heartbeat'
+wd_lifecheck_method = heartbeat
+wd_monitoring_interfaces_list = 'enp3s0'
 
-wd_hostname = '192.168.122.150'
-wd_port = 9000
-wd_priority0 = 1
-wd_authkey0 = 'CHANGE_ME_WD_AUTH'
-
-# Watchdog peers (indexed: 0,1,2 — must list ALL nodes)
-wd_hostname0 = '192.168.122.150'
+# Watchdog nodes (indexed: 0,1,2 — must list ALL nodes)
+hostname0 = '192.168.122.150'
 wd_port0 = 9000
-wd_hostname1 = '192.168.122.151'
+pgpool_port0 = 9999
+hostname1 = '192.168.122.151'
 wd_port1 = 9000
-wd_hostname2 = '192.168.122.152'
+pgpool_port1 = 9999
+hostname2 = '192.168.122.152'
 wd_port2 = 9000
+pgpool_port2 = 9999
 
-# Heartbeat (4.3.5 legacy names: heartbeat_destination, heartbeat_destination_port, heartbeat_interface)
-heartbeat_destination0 = '192.168.122.151'
-heartbeat_destination_port0 = 9694
-heartbeat_interface0 = 'enp3s0'
-heartbeat_destination1 = '192.168.122.152'
-heartbeat_destination_port1 = 9694
-heartbeat_interface1 = 'enp3s0'
+# Local node priority + auth key
+wd_priority = 1
+wd_authkey = 'CHANGE_ME_WD_AUTH'
 
-# Virtual IP
-vip = 1
-vip_ip = '192.168.122.200'
-vip_ifconfig = 'ifconfig enp3s0:0 192.168.122.200/24'
-vip_arping = 'arping -U -I enp3s0 -c 3 192.168.122.200'
-vip_cidr_prefix_length = 24
+# Exit pgpool if the watchdog loses quorum (prevents split-brain VIP)
+wd_quorum_exit = on
+
+# Heartbeat lifecheck (4.7 names: heartbeat_hostname, heartbeat_port, heartbeat_device)
+heartbeat_hostname0 = '192.168.122.151'
+heartbeat_port0 = 9694
+heartbeat_device0 = 'enp3s0'
+heartbeat_hostname1 = '192.168.122.152'
+heartbeat_port1 = 9694
+heartbeat_device1 = 'enp3s0'
+
+# Virtual IP — Debian 4.7 uses delegate_IP (uppercase IP)
 delegate_IP = '192.168.122.200'
+if_cmd_path = '/usr/sbin'
+if_up_cmd = '/usr/sbin/ip addr add 192.168.122.200/24 dev enp3s0 label enp3s0:pgpool'
+if_down_cmd = '/usr/sbin/ip addr del 192.168.122.200/24 dev enp3s0'
+arping_path = '/usr/sbin'
+arping_cmd = '/usr/sbin/arping -U 192.168.122.200 -w 1 -I enp3s0'
 ```
 
-> 🔑 **Key 4.3.5 vs 4.7 parameter differences:**
-> | 4.7 (CentOS, separate file) | 4.3.5 (Debian, inline) |
-> |-----------------------------|------------------------|
-> | `heartbeat_hostnameN` | `heartbeat_destinationN` |
-> | `heartbeat_portN` | `heartbeat_destination_portN` |
-> | `heartbeat_deviceN` | `heartbeat_interfaceN` |
-> | `wd_priority` (unindexed) | `wd_priority0` (indexed) |
-> | `wd_authkey` (unindexed) | `wd_authkey0` (indexed) |
-> | `delegate_ip` | `delegate_IP` (uppercase) |
-> | `pgpool_watchdog.conf` | inline in `pgpool.conf` |
+> 🔑 **Key 4.7 parameter names (same on both distros):**
+> | Parameter | Value |
+> |-----------|-------|
+> | `heartbeat_hostnameN` | Peer hostname for heartbeat |
+> | `heartbeat_portN` | `9694` (MUST differ from `wd_port` `9000`) |
+> | `heartbeat_deviceN` | NIC name (`eth0` on RHEL, `enp3s0` on Debian) |
+> | `delegate_ip` / `delegate_IP` | The floating VIP |
+> | `wd_quorum_exit` | `on` — exit if watchdog quorum lost |
 
 Per-node files (identical on both distros except config dir):
 
