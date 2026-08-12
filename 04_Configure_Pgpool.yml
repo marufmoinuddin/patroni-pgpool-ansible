@@ -57,12 +57,50 @@
           - "Data dir: {{ data_dir }}"
 
     # ============================================================
-    # 1. INSTALL PGROOL-II FROM PERCONA REPOS
+    # 1. INSTALL PGROOL-II FROM PERCONA REPOS (RHEL) / PGDG (Debian)
     # ============================================================
-    - name: Install Pgpool-II (Debian/Ubuntu)
+    - name: Remove any old pgpool2 apt pin that conflicts with PGDG 4.7
+      ansible.builtin.file:
+        path: /etc/apt/preferences.d/pgpool2
+        state: absent
+      when: ansible_os_family == "Debian"
+
+    - name: Add PGDG apt repository for pgpool2 4.7 (Debian/Ubuntu)
+      block:
+        - name: Install prerequisites for PGDG repo
+          apt:
+            name:
+              - wget
+              - gnupg
+              - lsb-release
+            state: present
+            update_cache: yes
+          when: ansible_os_family == "Debian"
+          register: pgdg_prereqs
+
+        - name: Add PGDG GPG key
+          ansible.builtin.shell: |
+            wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg
+          register: pgdg_key
+          changed_when: pgdg_key.rc == 0
+
+        - name: Add PGDG apt repository
+          ansible.builtin.apt_repository:
+            repo: "deb https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+            state: present
+            filename: pgdg
+          when: ansible_os_family == "Debian"
+
+        - name: Update apt cache after adding PGDG repo
+          apt:
+            update_cache: yes
+          when: ansible_os_family == "Debian"
+      when: ansible_os_family == "Debian"
+
+    - name: Install Pgpool-II (Debian/Ubuntu) — pinned to PGDG 4.7.x
       apt:
         name:
-          - pgpool2
+          - "pgpool2=4.7.2-1.pgdg{{ ansible_distribution_major_version }}+1"
         state: present
         update_cache: yes
       when: ansible_os_family == "Debian"

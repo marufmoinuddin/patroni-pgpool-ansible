@@ -23,7 +23,8 @@ PORT="9999"
 DB="postgres"
 USER="pgpool_admin"
 PATRONI_CFG="/etc/patroni/patroni.yml"
-LEADER_IP="192.168.122.151"   # current leader (db2) — access point
+# LEADER_IP must be the current Patroni leader — query dynamically
+LEADER_IP=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.122.150 "patronictl -c /etc/patroni/patroni.yml list -f json 2>/dev/null" | jq -r '.[] | select(.Role=="Leader") | .Host')
 ALL_NODES=("192.168.122.150" "192.168.122.151" "192.168.122.152")
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 mkdir -p "$ARTIFACT_DIR"

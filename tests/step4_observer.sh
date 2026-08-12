@@ -24,7 +24,7 @@ ITERATIONS="${2:-720}"   # default 720 (24 min @ 2s) — covers the longest obse
                           # outage+rejoin span (~12 min) with 2x margin; hang bug
                           # (ServerAliveInterval) is fixed so long windows are free.
 POLL_SECS="${3:-2}"
-POOL_HOST_IP="${4:-192.168.122.150}"   # db1 by default — change per iteration
+POOL_HOST_IP="${4:-192.168.122.200}"   # Use VIP for pool_nodes query
 
 mkdir -p "$ARTIFACT_DIR"
 OUT="$ARTIFACT_DIR/observe_iter.log"
@@ -36,10 +36,12 @@ declare -A NODE_IP=( [db1]="192.168.122.150" [db2]="192.168.122.151" [db3]="192.
 # established connections (a node killed mid-session otherwise hangs the poll loop
 # forever — observed in Iteration 2). timeout(1) is the last-resort hard cap.
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=2 -o ServerAliveInterval=2 -o ServerAliveCountMax=3"
-POOL_HOST="$POOL_HOST_IP"   # any SURVIVOR node with pgpool for the pool_nodes read
+# pool_nodes via VIP
+PGPW=$(ssh $SSH_OPTS root@192.168.122.151 "grep ^pgpool_admin: /etc/pgpool2/pool_passwd | cut -d: -f2" 2>/dev/null | tr -d '\r\n')
+POOL_QUERY="PGPASSWORD=$PGPW psql -h 192.168.122.200 -p 9999 -U pgpool_admin -d postgres -tAc 'SHOW pool_nodes;'" 
+
 # Helper scripts pre-shipped to each node (avoids fragile nested quoting).
 REC_HELPER="/tmp/node_recovery.sh"
-POOL_HELPER="/tmp/pool_nodes.sh"
 
 for ((i=1; i<=ITERATIONS; i++)); do
     TS=$(date -u +%FT%TZ)
@@ -55,9 +57,10 @@ for ((i=1; i<=ITERATIONS; i++)); do
         LINE="$LINE $n.recovery=$R"
     done
 
-    # Pooled routing view (pgpool) — from the configured SURVIVOR node
-    P=$(timeout 5 ssh $SSH_OPTS "root@$POOL_HOST" "bash $POOL_HELPER" \
+    # Pooled routing view (pgpool) — via VIP (works from VPS)
+    P=$(timeout 5 ssh $SSH_OPTS root@192.168.122.151 "$POOL_QUERY" \
         2>/dev/null | tr -d '[:space:]')
+    [ -z "$P" ] && P="UNAVAILABLE"
     LINE="$LINE pool=[$P]"
 
     echo "$LINE" | tee -a "$OUT"
