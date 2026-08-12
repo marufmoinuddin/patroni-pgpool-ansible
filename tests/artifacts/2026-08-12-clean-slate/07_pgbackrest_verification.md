@@ -25,6 +25,10 @@ P00 INFO: check command end: completed successfully (3140ms)
 
 ## Note for future runs
 
-`pgbackrest --stanza=pg1 check` will fail with "stanza path missing" — that is the wrong stanza
-name. Always use `--stanza=kyc`.
+- `pgbackrest --stanza=pg1 check` will fail with "stanza path missing" — that is the wrong stanza
+  name. Always use `--stanza=kyc`.
+- Run the check as the **postgres** user (`su - postgres -c "pgbackrest --config=/etc/pgbackrest.conf --stanza=kyc check"`).
+  Running it as root produces `[255]: Host key verification failed` for every pg host because
+  root has no `known_hosts` on br1 — a probe artifact, NOT a cluster fault. The postgres user's
+  `~/.ssh/known_hosts` has all three db hosts pinned, and archiving runs as postgres (playbook 05).
 
