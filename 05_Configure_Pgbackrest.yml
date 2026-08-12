@@ -216,11 +216,14 @@
       when: pgbackrest_unit_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
 
     # Clear any historical failure state from pre-mask runs (upgrade path) so
-    # monitoring sees only "masked", never "failed".
+    # monitoring sees only "masked", never "failed". Debian ships no unit at
+    # all, so reset-failed on it errors "Unit pgbackrest.service not loaded" —
+    # only run this where a unit file exists.
     - name: Clear historical pgBackRest failure state
       command: systemctl reset-failed pgbackrest.service
       register: pgrst
       changed_when: pgrst.rc != 0
+      when: pgbackrest_unit_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
 
 - name: Configure PostgreSQL nodes for pgBackRest
   hosts: pg_nodes
@@ -402,11 +405,14 @@
       when: pgbackrest_unit_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
 
     # Clear any historical failure state from pre-mask runs (upgrade path) so
-    # monitoring sees only "masked", never "failed".
+    # monitoring sees only "masked", never "failed". Debian ships no unit at
+    # all, so reset-failed on it errors "Unit pgbackrest.service not loaded" —
+    # only run this where a unit file exists.
     - name: Clear historical pgBackRest failure state
       command: systemctl reset-failed pgbackrest.service
       register: pgrst
       changed_when: pgrst.rc != 0
+      when: pgbackrest_unit_files.results | selectattr('stat.exists', 'equalto', true) | list | length > 0
 
     # Set up SSH known_hosts to prevent interactive prompts
     - name: Add pgBackRest host to known_hosts
