@@ -59,6 +59,12 @@
     # ============================================================
     # 1. INSTALL PGROOL-II FROM PERCONA REPOS (RHEL) / PGDG (Debian)
     # ============================================================
+    - name: Remove any old pgpool2 apt pin that conflicts with PGDG 4.7
+      ansible.builtin.file:
+        path: /etc/apt/preferences.d/pgpool2
+        state: absent
+      when: ansible_os_family == "Debian"
+
     - name: Add PGDG apt repository for pgpool2 4.7 (Debian/Ubuntu)
       block:
         - name: Install prerequisites for PGDG repo
@@ -74,6 +80,7 @@
         - name: Add PGDG GPG key
           ansible.builtin.shell: |
             wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg >/dev/null
+            apt-key add /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg 2>/dev/null || true
           when: ansible_os_family == "Debian"
 
         - name: Add PGDG apt repository
