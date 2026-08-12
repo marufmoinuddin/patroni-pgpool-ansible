@@ -28,16 +28,16 @@
       when: ansible_os_family == "RedHat"
 
     # ============================================================
-    # RESILIENCE: namespace alias + etcd member resolution.
-    # `namespace` was previously UNDEFINED (variables.yaml only ships
-    # patroni_namespace) - patroni.yml rendered `namespace: ` empty and the
+    # RESILIENCE: dcs_namespace alias + etcd member resolution.
+    # `dcs_namespace` was previously UNDEFINED (variables.yaml only ships
+    # patroni_namespace) - patroni.yml rendered `dcs_namespace: ` empty and the
     # etcd cleanup keys were wrong. Also, Patroni must talk to ALL etcd
     # endpoints (dedicated witness group if configured, else co-located
     # pg_nodes) so DCS access survives a local etcd failure.
     # ============================================================
-    - name: Resolve namespace alias and etcd member hosts
+    - name: Resolve dcs_namespace alias and etcd member hosts
       set_fact:
-        namespace: "{{ namespace | default(patroni_namespace) }}"
+        dcs_namespace: "{{ dcs_namespace | default(patroni_namespace) }}"
         etcd_member_hosts: "{{ groups[etcd_group] if (etcd_group is defined and etcd_group | length > 0) else groups['pg_nodes'] }}"
 
     - name: Build ETCD client endpoint list for Patroni (client-side DCS redundancy)
@@ -225,12 +225,12 @@
     - name: Perform complete ETCD cleanup
       ansible.builtin.shell: |
         for key in \
-          "/{{ namespace }}/{{ patroni_scope }}" \
-          "/{{ namespace }}/{{ patroni_scope }}/leader" \
-          "/{{ namespace }}/{{ patroni_scope }}/system_id" \
-          "/{{ namespace }}/{{ patroni_scope }}/initialize" \
-          "/{{ namespace }}/{{ patroni_scope }}/members" \
-          "/{{ namespace }}/{{ patroni_scope }}/config"
+          "/{{ dcs_namespace }}/{{ patroni_scope }}" \
+          "/{{ dcs_namespace }}/{{ patroni_scope }}/leader" \
+          "/{{ dcs_namespace }}/{{ patroni_scope }}/system_id" \
+          "/{{ dcs_namespace }}/{{ patroni_scope }}/initialize" \
+          "/{{ dcs_namespace }}/{{ patroni_scope }}/members" \
+          "/{{ dcs_namespace }}/{{ patroni_scope }}/config"
         do
           /usr/bin/etcdctl --endpoints="{{ etcd_client_endpoints }}" del "$key" --prefix
         done
@@ -245,7 +245,7 @@
           register: data_dir_stat
 
         - name: Check ETCD keys
-          ansible.builtin.shell: "etcdctl --endpoints='{{ etcd_client_endpoints }}' get '/{{ namespace }}/{{ scope }}' --prefix | wc -l"
+          ansible.builtin.shell: "etcdctl --endpoints='{{ etcd_client_endpoints }}' get '/{{ dcs_namespace }}/{{ scope }}' --prefix | wc -l"
           register: etcd_keys
           ignore_errors: yes
 
@@ -343,7 +343,7 @@
         owner: postgres
         group: postgres
         block: |
-          namespace: {{ namespace }}
+          dcs_namespace: {{ dcs_namespace }}
           scope: {{ scope }}
           name: {{ node_name }}
 

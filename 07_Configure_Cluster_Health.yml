@@ -20,7 +20,7 @@
   vars_files:
     - variables.yaml
   vars:
-    namespace: "{{ namespace | default(patroni_namespace) }}"
+    dcs_namespace: "{{ dcs_namespace | default(patroni_namespace) }}"
     scope: "{{ patroni_scope }}"
     etcd_member_hosts: "{{ groups[etcd_group] if (etcd_group is defined and etcd_group | length > 0) else groups['pg_nodes'] }}"
     etcd_client_endpoints: "{{ etcd_member_hosts | map('extract', hostvars, ['ansible_host']) | map('regex_replace', '^(.*)$', 'http://\\1:2379') | join(',') }}"
