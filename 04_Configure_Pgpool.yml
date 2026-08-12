@@ -80,21 +80,19 @@
 
         - name: Add PGDG GPG key
           ansible.builtin.shell: |
-            wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg
-          register: pgdg_key
-          changed_when: pgdg_key.rc == 0
+            wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor | tee /usr/share/keyrings/pgdg.gpg > /dev/null
+          args:
+            creates: /usr/share/keyrings/pgdg.gpg
 
         - name: Add PGDG apt repository
           ansible.builtin.apt_repository:
             repo: "deb https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
             state: present
             filename: pgdg
-          when: ansible_os_family == "Debian"
 
         - name: Update apt cache after adding PGDG repo
           apt:
             update_cache: yes
-          when: ansible_os_family == "Debian"
       when: ansible_os_family == "Debian"
 
     - name: Install Pgpool-II (Debian/Ubuntu) — pinned to PGDG 4.7.x
