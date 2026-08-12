@@ -92,7 +92,7 @@
     - name: Install Pgpool-II (Debian/Ubuntu) — pinned to PGDG 4.7.x
       apt:
         name:
-          - "pgpool2=4.7.2-1.pgdg{{ ansible_distribution_version }}+1"
+          - "pgpool2=4.7.2-1.pgdg{{ ansible_distribution_major_version }}+1"
         state: present
         update_cache: yes
       when: ansible_os_family == "Debian"
