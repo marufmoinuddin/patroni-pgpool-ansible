@@ -76,19 +76,13 @@
             state: present
             update_cache: yes
           when: ansible_os_family == "Debian"
-          retries: 3
-          delay: 5
           register: pgdg_prereqs
-          until: pgdg_prereqs is succeeded
 
         - name: Add PGDG GPG key
           ansible.builtin.shell: |
             wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/apt.postgresql.org.gpg
-          when: ansible_os_family == "Debian"
-          retries: 3
-          delay: 5
           register: pgdg_key
-          until: pgdg_key is succeeded
+          changed_when: pgdg_key.rc == 0
 
         - name: Add PGDG apt repository
           ansible.builtin.apt_repository:
