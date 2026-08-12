@@ -8,7 +8,7 @@ Welcome! This repository builds a **production-grade, 3-node high-availability P
 - **etcd** — the distributed consensus store that holds the leader lock
 - **pgpool-II + Watchdog** — the "traffic controller" that gives applications one Virtual IP (VIP)
   - **CentOS/RHEL:** pgpool-II 4.7 (Percona package, config in `/etc/pgpool-II`, separate `pgpool_watchdog.conf`)
-  - **Debian/Ubuntu:** native `pgpool2` 4.3.5 (Debian repo, config in `/etc/pgpool2`, watchdog params inline in `pgpool.conf`)
+  - **Debian/Ubuntu:** pgpool2 4.7.x from PGDG (config in `/etc/pgpool2`, watchdog params inline in `pgpool.conf`)
 - **pgBackRest** — backup & point-in-time recovery
 - **PMM (Percona Monitoring & Management)** — dashboards and alerts (optional, policy-controlled)
 
@@ -594,10 +594,10 @@ patroni-pgpool-ansible/
 
 | # | Playbook | What It Does (Plain English) |
 |---|----------|------------------------------|
-| 01 | `01_Install_Percona.yml` | Adds the Percona repository, enables EPEL + CRB (RHEL), installs PostgreSQL 16, Patroni, etcd, pgpool-II, pgBackRest, jq — and **purges any old/broken installs** so you start clean. On **Debian**: installs native `pgpool2` **BEFORE** enabling Percona repo, then pins `libpgpool2=4.3.5*` to prevent version conflicts with Percona's PostgreSQL 16 modules. |
+| 01 | `01_Install_Percona.yml` | Adds the Percona repository, enables EPEL + CRB (RHEL), installs PostgreSQL 16, Patroni, etcd, pgpool-II, pgBackRest, jq — and **purges any old/broken installs** so you start clean. On **Debian**: installs pgpool2 **from PGDG 4.7.x** after bootstrapping the PGDG repo. |
 | 02 | `02_Configure_Etcd.yml` | Writes the etcd config on all 3 nodes, **wipes stale etcd data** (so a re-run bootstraps cleanly), starts etcd, and verifies quorum. |
 | 03 | `03_Configure_Patroni.yml` | Creates the PostgreSQL data directory, writes `patroni.yml` (the full HA config with pgtune-calculated parameters, watchdog, callbacks), installs the systemd unit with `ExecStartPre` waiting for etcd, **starts the primary first**, waits, then starts replicas — then verifies with `patronictl list`. |
-| 04 | `04_Configure_Pgpool.yml` | Writes `pgpool.conf` + **OS-conditional watchdog config** (CentOS: separate `pgpool_watchdog.conf` with 4.7 params; Debian: inline in `pgpool.conf` with legacy 4.3.5 params), `pool_hba.conf` + `pool_passwd` (plaintext for SCRAM) + `pcp.conf`, deploys Patroni-aware `failover.sh` / `follow_master.sh`, sets `pgpool_node_id`, and starts the watchdog cluster so the VIP is claimed. **Auto-detects VIP interface** (`eth0` on CentOS, `enp3s0` on Debian). |
+| 04 | `04_Configure_Pgpool.yml` | Writes `pgpool.conf` with **inline watchdog config for both distros** (RHEL: 4.7 params; Debian: 4.7 params from PGDG), `pool_hba.conf` + `pool_passwd` (plaintext for SCRAM) + `pcp.conf`, deploys Patroni-aware `failover.sh` / `follow_master.sh`, sets `pgpool_node_id`, and starts the watchdog cluster so the VIP is claimed. **Auto-detects VIP interface** (`eth0` on CentOS, `enp3s0` on Debian). |
 || 05 | `05_Configure_Pgbackrest.yml` | Installs/connects pgBackRest on the backup node, exchanges SSH keys with all PG nodes (using `StrictHostKeyChecking accept-new` for non-interactive automation), writes `pgbackrest.conf` with stanza `kyc`, and prints the exact commands to create the stanza + first backup. | Idempotent |
 || 06 | `06_Install_Pmm_Monitoring.yml` | Pulls and runs the PMM Server Docker container on the backup node (cleans stale `pmm-data` volume first), opens the firewall for it, installs PMM Client on all 3 PG nodes, and registers them with the server. | **DISABLED in site.yml by policy** — see §12.8 |
 || 07 | `07_Configure_Cluster_Health.yml` | Deploys two systemd timers: `patroni-self-heal.timer` (30s, restarts crashed local Patroni member) and `cluster-health.timer` (60s, checks etcd quorum, Patroni leader, pgpool watchdog quorum, backend status, VIP presence). Also deploys the auto-reattach timer (`reattach_nodes.sh`) and durable event logging. | Always runs |
@@ -862,13 +862,31 @@ dnf install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
 # 3. Enable the PostgreSQL 16 Percona repository
 percona-release setup ppg-16
 
-# 4. Install everything
+# 4. Install PostgreSQL 16 server + contrib
 dnf install -y \
   percona-postgresql16-server \
-  percona-patroni percona-patroni-etcd etcd jq \
-  percona-pgpool-II-pg16 percona-pgpool-II-pg16-extensions \
-  percona-pgbackrest
+  percona-postgresql16-contrib
+
+# 5. Install ETCD, Patroni, pgBackRest, Python deps, jq
+dnf install -y \
+  etcd \
+  percona-patroni \
+  percona-pgbackrest \
+  python3 python3-psycopg2 python3-pip python3-etcd python3-yaml \
+  jq
+
+# 6. Install pgpool-II 4.7 (pgpool2 install is now in playbook 04 with PGDG 4.7)
+dnf install -y \
+  percona-pgpool-II-pg16
+
+# 7. Install percona-pg_stat_monitor16 (RHEL only — Debian skips this)
+dnf install -y percona-pg_stat_monitor16
+
+# 8. Install Docker (for PMM client, if you ever re-enable play 06)
+dnf install -y docker
 ```
+
+> 📋 **Debian note:** playbook 01 installs `percona-postgresql-16` + `percona-postgresql-client-16` on Debian. The manual section below matches.
 
 #### Debian / Ubuntu
 
@@ -887,6 +905,7 @@ apt install -y pgpool2
 # 4. Install the rest from Percona
 apt install -y \
   percona-postgresql-16 \
+  percona-postgresql-client-16 \
   percona-patroni etcd \
   percona-pgbackrest
 ```
@@ -897,68 +916,64 @@ apt install -y \
 
 ### Phase 2 — etcd Cluster (db1, db2, db3)
 
-Create `/etc/etcd/etcd.conf` — the token and member IPs **must be identical** on all three nodes; only `name` and `initial-advertise-peer-urls` differ:
+The playbook writes a **systemd unit with inline `--flags`** (no `/etc/etcd/etcd.conf` file), auto-detects whether the data dir is on volatile storage (refuses tmpfs/ramfs), and **never wipes etcd data on re-runs** unless you set `etcd_force_reset: true` in `variables.yaml`.
 
-```ini
-# /etc/etcd/etcd.conf  (db1 example)
-ETCD_NAME="db1"
-ETCD_DATA_DIR="/var/lib/etcd"
-ETCD_LISTEN_CLIENT_URLS="http://0.0.0.0:2379"
-ETCD_LISTEN_PEER_URLS="http://0.0.0.0:2380"
-ETCD_ADVERTISE_CLIENT_URLS="http://192.168.122.150:2379"
-ETCD_INITIAL_ADVERTISE_PEER_URLS="http://192.168.122.150:2380"
-ETCD_INITIAL_CLUSTER="db1=http://192.168.122.150:2380,db2=http://192.168.122.151:2380,db3=http://192.168.122.152:2380"
-ETCD_INITIAL_CLUSTER_STATE="new"
-ETCD_INITIAL_CLUSTER_TOKEN="PostgreSQL_HA_Cluster_1"
-```
+> ⚠️ **Debian gotcha:** the Debian `etcd-server` package postinst auto-starts etcd with a **packaged config-file unit** (`--config-file /etc/etcd/etcd.conf.yaml`) that binds 127.0.0.1 and bootstraps a bogus single-member "default" cluster. The playbook detects this, stops it, removes the stale `default.etcd` data dir, and writes the correct custom unit. On a manual deploy, do the same.
 
-> Swap `ETCD_NAME` and the two `...ADVERTISE...` values on db2 (`192.168.122.151`) and db3 (`192.168.122.152`).
-
-Create the systemd unit (identical on both distros):
+#### Manual etcd setup (all nodes)
 
 ```bash
+# 1. Install etcd (already done in Phase 1)
+# RHEL: dnf install -y etcd
+# Debian: apt install -y etcd
+
+# 2. On Debian ONLY — stop the packaged auto-started instance if present
+systemctl stop etcd 2>/dev/null || true
+rm -rf /var/lib/etcd/default.etcd 2>/dev/null || true
+
+# 3. Create data directory (must be on persistent disk)
+mkdir -p /var/lib/etcd
+chown -R etcd:etcd /var/lib/etcd
+
+# 4. Verify it's NOT on tmpfs/ramfs
+findmnt -n -o FSTYPE --target /var/lib/etcd
+# Must NOT print tmpfs or ramfs
+
+# 5. Write the systemd unit (inline ExecStart — no /etc/etcd/etcd.conf)
 cat > /etc/systemd/system/etcd.service <<'EOF'
 [Unit]
 Description=etcd key-value store
 Documentation=https://etcd.io/docs/
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Environment="TOKEN=PostgreSQL_HA_Cluster_1"
-Environment="CLUSTER_STATE=new"
-Environment="THIS_NAME={{ ansible_hostname }}"
-Environment="THIS_IP={{ ansible_default_ipv4.address }}"
-Environment="CLUSTER=db1=http://192.168.122.150:2380,db2=http://192.168.122.151:2380,db3=http://192.168.122.152:2380"
-
 ExecStart=/usr/bin/etcd \
   --data-dir=/var/lib/etcd \
-  --name ${THIS_NAME} \
-  --initial-advertise-peer-urls http://${THIS_IP}:2380 \
-  --listen-peer-urls http://${THIS_IP}:2380 \
-  --advertise-client-urls http://${THIS_IP}:2379 \
-  --listen-client-urls http://${THIS_IP}:2379 \
-  --initial-cluster ${CLUSTER} \
-  --initial-cluster-state ${CLUSTER_STATE} \
-  --initial-cluster-token ${TOKEN}
+  --name db1 \
+  --initial-advertise-peer-urls http://192.168.122.150:2380 \
+  --listen-peer-urls http://192.168.122.150:2380 \
+  --advertise-client-urls http://192.168.122.150:2379 \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --initial-cluster db1=http://192.168.122.150:2380,db2=http://192.168.122.151:2380,db3=http://192.168.122.152:2380 \
+  --initial-cluster-state new \
+  --initial-cluster-token PostgreSQL_HA_Cluster_1
 
 Restart=always
 RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Swap the name and IPs per node (db1 → .150, db2 → .151, db3 → .152).
+# Set --initial-cluster-state=existing on re-runs/reboots (members already know each other).
 ```
 
-```bash
-# Start etcd on ALL THREE nodes (roughly together — quorum needs 2/3)
-systemctl daemon-reload
-systemctl enable --now etcd
-
-# Verify quorum from any node
-ETCDCTL_API=3 etcdctl --endpoints=http://192.168.122.150:2379 endpoint health
-ETCDCTL_API=3 etcdctl --endpoints=http://192.168.122.150:2379 member list
-# All 3 members must show "healthy: true"
-```
+> 📋 **No etcd.conf file.** The playbook deploys all configuration via inline `--flags` on the `ExecStart` line. There is no `/etc/etcd/etcd.conf` or `/etc/etcd/etcd.conf.yaml`, and no `Environment=` indirection.
+>
+> 📋 **No wipe on re-run.** The playbook only wipes `/var/lib/etcd/*` when `etcd_force_reset: true`. On a healthy re-run it leaves the data dir intact and uses `--initial-cluster-state=existing`.
 
 ---
 
@@ -1070,21 +1085,29 @@ mkdir -p /var/lib/pgsql/16 /etc/patroni
 chown -R postgres:postgres /var/lib/pgsql
 
 # systemd unit (Patroni binary at /usr/bin/patroni)
+# Key details from the playbook:
+# - ExecStartPre waits for etcd (up to 90s) before starting Patroni
+# - Requires=etcd.service when etcd is co-located on this node
+# - Restart=on-failure with RestartSec=15s, StartLimitIntervalSec=0 (never gives up)
 cat > /etc/systemd/system/patroni.service <<'EOF'
 [Unit]
 Description=Runners to orchestrate a high-availability PostgreSQL
-After=syslog.target network.target etcd.service
+After=syslog.target network-online.target etcd.service
+Wants=network-online.target
+Requires=etcd.service   # remove this line if using dedicated etcd_nodes
 
 [Service]
 Type=simple
 User=postgres
 Group=postgres
+ExecStartPre=/usr/local/sbin/wait_for_etcd.sh
 ExecStart=/usr/bin/patroni /etc/patroni/patroni.yml
 ExecReload=/bin/kill -s HUP $MAINPID
 KillMode=process
 TimeoutSec=30
-Restart=always
-RestartSec=10s
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -1096,32 +1119,32 @@ systemctl daemon-reload
 ##### Debian / Ubuntu
 
 ```bash
-# Create the cluster with pg_createcluster (on PRIMARY ONLY - db1)
+# Create the data directory (Patroni will initdb on first bootstrap)
 mkdir -p /postgres/data/16 /etc/patroni
 chown -R postgres:postgres /postgres
 
-# On PRIMARY (db1) only:
-pg_createcluster 16 kyc -d /postgres/data/16/kyc
-
-# Stop it so Patroni can take over
-pg_ctlcluster 16 kyc stop
-
 # systemd unit (Patroni binary at /bin/patroni)
+# Same resilience details as RHEL: ExecStartPre etcd guard, conditional Requires,
+# Restart=on-failure with RestartSec=15s, StartLimitIntervalSec=0.
 cat > /etc/systemd/system/patroni.service <<'EOF'
 [Unit]
 Description=Runners to orchestrate a high-availability PostgreSQL
-After=syslog.target network.target etcd.service
+After=syslog.target network-online.target etcd.service
+Wants=network-online.target
+Requires=etcd.service   # remove this line if using dedicated etcd_nodes
 
 [Service]
 Type=simple
 User=postgres
 Group=postgres
+ExecStartPre=/usr/local/sbin/wait_for_etcd.sh
 ExecStart=/bin/patroni /etc/patroni/patroni.yml
 ExecReload=/bin/kill -s HUP $MAINPID
 KillMode=process
 TimeoutSec=30
-Restart=always
-RestartSec=10s
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -1129,6 +1152,10 @@ EOF
 
 systemctl daemon-reload
 ```
+
+> 📋 **The `wait_for_etcd.sh` script** is deployed by playbook 03 to `/usr/local/sbin/wait_for_etcd.sh`. It's a dependency-free TCP probe that waits up to `etcd_wait_timeout` (default 90s) for at least one etcd endpoint to accept connections. Without it, Patroni races etcd at boot and can give up before DCS is ready.
+>
+> 📋 **`Requires=etcd.service`** is only present when etcd is co-located on this node (the default `pg_nodes` group). If you use `etcd_group: "etcd_nodes"` (dedicated witnesses), remove the `Requires=` line — Patroni talks to remote etcd endpoints and a local etcd failure must not take Patroni down.
 
 #### Bootstrap the cluster — start the primary FIRST
 
@@ -1150,6 +1177,35 @@ patronictl -c /etc/patroni/patroni.yml list
 
 > 🧠 **Why primary first?** If you start a replica before any primary exists, Patroni would *also* try to bootstrap — two nodes racing to initdb is chaos. The leader lock in etcd prevents a real split-brain, but starting in order is clean and predictable.
 
+#### Patroni `on_role_change` callback (08 — closes the clean-switchover gap)
+
+The playbook 03 deploys `files/pgpool_role_signal.sh` as the `on_role_change` callback. For a manual deployment, add this block to the `tags:` section of `patroni.yml`:
+
+```yaml
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
+  # Active switchover notification to pgpool (eliminates ~4-min polling gap)
+  on_role_change: /usr/local/sbin/pgpool_role_signal.sh
+```
+
+And deploy the script itself (from `files/pgpool_role_signal.sh`):
+
+```bash
+cat > /usr/local/sbin/pgpool_role_signal.sh <<'SCRIPT'
+#!/bin/bash
+# Patroni on_role_change callback — tells pgpool about primary promotion
+# Deployed by 08_Configure_Switchover_Signal.yml
+# Requires: pcp.conf with matching auth, pcp_promote_node on all pgpool nodes
+SCRIPT
+chmod +x /usr/local/sbin/pgpool_role_signal.sh
+chown postgres:postgres /usr/local/sbin/pgpool_role_signal.sh
+```
+
+> **Why this matters:** without this callback, pgpool only discovers a clean Patroni switchover via `sr_check` polling (`sr_check_period=3s` by default). With the callback, `pcp_promote_node` fires immediately on promotion — closing the write-availability gap from ~4 minutes to ~3–4 seconds.
+
 ---
 
 ### Phase 4 — pgpool-II + Watchdog + VIP (db1, db2, db3)
@@ -1168,7 +1224,7 @@ The full `pgpool.conf` is long — here is the **watchdog-relevant essence** (pe
 # pgpool.conf  (db1 example — key lines, watchdog INLINE)
 listen_addresses = '*'
 port = 9999
-socket_dir = '/var/run/pgpool'
+socket_dir = '/var/run/postgresql'          # playbook uses /var/run/postgresql (NOT /var/run/pgpool)
 
 backend_hostname0 = '192.168.122.150'
 backend_port0 = 5432
@@ -1188,22 +1244,32 @@ backend_weight2 = 1
 backend_data_directory2 = '/var/lib/pgsql/16/data/kyc'   # RHEL PATH
 backend_flag2 = 'ALLOW_TO_FAILOVER'
 
-# Health checks
-health_check_period = 10
-health_check_timeout = 20
+# Health checks (playbook values: period=5, timeout=10, max_retries=3, retry_delay=1)
+health_check_period = 5
+health_check_timeout = 10
 health_check_user = 'pgpool'
 health_check_password = 'CHANGE_ME_HEALTH'
+health_check_database = 'postgres'
+health_check_max_retries = 3
+health_check_retry_delay = 1
+connect_timeout = 10
 
-# Streaming replication check
+# Streaming replication check (REQUIRED: unset values cause "no PostgreSQL user name specified")
+# sr_check_period lowered 10->3 (2026-08-12): bounds residual clean-switchover detection window
 sr_check_period = 3
 sr_check_user = 'pgpool'
 sr_check_password = 'CHANGE_ME_HEALTH'
-delay_threshold = 1048576
+sr_check_database = 'postgres'
+delay_threshold = 10000000
 
 # PCP
 pcp_listen_addresses = '*'
 pcp_port = 9898
-pcp_socket_dir = '/var/run/pgpool'
+pcp_socket_dir = '/var/run/postgresql'      # playbook uses /var/run/postgresql
+
+# Failover / Failback (paths use {{ pgpool_conf_dir }} — substitute /etc/pgpool-II)
+failover_command = '/etc/pgpool-II/failover.sh %d %h %p %D %m %H %M %P %r %R'
+follow_master_command = '/etc/pgpool-II/follow_master.sh %d %h %p %D %m %H %M %P %r %R'
 
 # Watchdog (INLINE in pgpool.conf — 4.7 parameter names)
 use_watchdog = on
@@ -1221,7 +1287,7 @@ hostname2 = '192.168.122.152'
 wd_port2 = 9000
 pgpool_port2 = 9999
 
-# Local node priority + auth key
+# Local node priority + auth key (unindexed in 4.7)
 wd_priority = 1
 wd_authkey = 'CHANGE_ME_WD_AUTH'
 
@@ -1251,7 +1317,7 @@ arping_cmd = '/usr/sbin/arping -U 192.168.122.200 -w 1 -I eth0'
 # pgpool.conf  (db1 example — key lines, watchdog INLINE)
 listen_addresses = '*'
 port = 9999
-socket_dir = '/var/run/pgpool'
+socket_dir = '/var/run/postgresql'          # playbook uses /var/run/postgresql (NOT /var/run/pgpool)
 
 backend_hostname0 = '192.168.122.150'
 backend_port0 = 5432
@@ -1271,22 +1337,32 @@ backend_weight2 = 1
 backend_data_directory2 = '/postgres/data/16/kyc'   # DEBIAN PATH
 backend_flag2 = 'ALLOW_TO_FAILOVER'
 
-# Health checks
-health_check_period = 10
-health_check_timeout = 20
+# Health checks (playbook values: period=5, timeout=10, max_retries=3, retry_delay=1)
+health_check_period = 5
+health_check_timeout = 10
 health_check_user = 'pgpool'
 health_check_password = 'CHANGE_ME_HEALTH'
+health_check_database = 'postgres'
+health_check_max_retries = 3
+health_check_retry_delay = 1
+connect_timeout = 10
 
-# Streaming replication check
+# Streaming replication check (REQUIRED: unset values cause "no PostgreSQL user name specified")
+# sr_check_period lowered 10->3 (2026-08-12): bounds residual clean-switchover detection window
 sr_check_period = 3
 sr_check_user = 'pgpool'
 sr_check_password = 'CHANGE_ME_HEALTH'
-delay_threshold = 1048576
+sr_check_database = 'postgres'
+delay_threshold = 10000000
 
 # PCP
 pcp_listen_addresses = '*'
 pcp_port = 9898
-pcp_socket_dir = '/var/run/pgpool'
+pcp_socket_dir = '/var/run/postgresql'      # playbook uses /var/run/postgresql
+
+# Failover / Failback (paths use {{ pgpool_conf_dir }} — substitute /etc/pgpool2)
+failover_command = '/etc/pgpool2/failover.sh %d %h %p %D %m %H %M %P %r %R'
+follow_master_command = '/etc/pgpool2/follow_master.sh %d %h %p %D %m %H %M %P %r %R'
 
 # Watchdog (INLINE in pgpool.conf — same 4.7 parameter names as RHEL)
 use_watchdog = on
@@ -1304,7 +1380,7 @@ hostname2 = '192.168.122.152'
 wd_port2 = 9000
 pgpool_port2 = 9999
 
-# Local node priority + auth key
+# Local node priority + auth key (unindexed in 4.7)
 wd_priority = 1
 wd_authkey = 'CHANGE_ME_WD_AUTH'
 
@@ -1336,6 +1412,8 @@ arping_cmd = '/usr/sbin/arping -U 192.168.122.200 -w 1 -I enp3s0'
 > | `heartbeat_deviceN` | NIC name (`eth0` on RHEL, `enp3s0` on Debian) |
 > | `delegate_ip` / `delegate_IP` | The floating VIP |
 > | `wd_quorum_exit` | `on` — exit if watchdog quorum lost |
+>
+> 📋 **socket_dir / pcp_socket_dir:** the playbook uses `/var/run/postgresql` (not `/var/run/pgpool`). The directory must exist and be writable by the `postgres` user.
 
 Per-node files (identical on both distros except config dir):
 
@@ -1467,7 +1545,13 @@ sudo -iu postgres pgbackrest --stanza=kyc info
 
 ---
 
-### Phase 6 — PMM (backup node `.153` + PG nodes)
+### Phase 6 — PMM — DISABLED BY POLICY
+
+Play 06 (`06_Install_Pmm_Monitoring.yml`) is **commented out in `site.yml` by policy**.
+
+> ⚠️ **Do NOT re-enable without an explicit decision.** The br1 host (2 vCPU) saturated under the combined ClickHouse/Grafana/VictoriaMetrics/PMM load and its sshd path wedged during Test 2. If monitoring is needed, resize br1 or split the metrics stack first.
+
+The commands below are preserved for reference only:
 
 #### RHEL / CentOS / Stream 9
 
@@ -1598,8 +1682,12 @@ pcp_pool_status -h localhost -p 9898 -U pgpool_pcp -w
 pcp_attach_node -h localhost -p 9898 -U pgpool_pcp -w -n 1
 pcp_detach_node -h localhost -p 9898 -U pgpool_pcp -w -n 1
 
+# Promote a backend to primary manually
+pcp_promote_node -h localhost -p 9898 -U pgpool_pcp -w -n 1
+
 # pgpool logs
-journalctl -u pgpool -f
+journalctl -u pgpool -f         # RHEL
+# journalctl -u pgpool2 -f      # Debian
 ```
 
 ### Backups (pgBackRest — backup node)
@@ -1767,7 +1855,7 @@ No HA topology survives every node dying at once — that is disaster recovery, 
 | **VIP not moving** | sudoers / capability issues | `sudoers.d/pgpool-vip` entry present? `journalctl -u pgpool` for vip_up/down errors |
 | **Watchdog not forming** | Firewall 9000, auth key mismatch, heartbeat port collision | Open UDP/TCP 9000 (wd_port) and 9694 (heartbeat_port) between nodes; `wd_authkey` identical everywhere; heartbeat_port MUST differ from wd_port; nodes reachable |
 | **pgpool rejects config** | Unindexed `wd_*` params | Pgpool 4.5+ requires `wd_port0/1/2` (indexed); remove bare `wd_port`, `wd_authkey`, etc. |
-| **Debian installs wrong pgpool** | Percona repo pulls pgpool-II 4.7 libs | Debian MUST use native `pgpool2` 4.3.5: purge `percona-release`/`postgresql-client-common`/`libpgpool2`, `dpkg --configure -a && apt-get -f install`, install native `pgpool2` BEFORE enabling the Percona repo, then `apt-mark hold pgpool2` / pin `4.3.5*` |
+|| **Debian installs wrong pgpool** | Percona repo pulls pgpool-II 4.7 libs / stale pin | Debian MUST use pgpool2 from PGDG 4.7.x: remove any old `apt pin` in `/etc/apt/preferences.d/pgpool2`, ensure PGDG repo is added, `apt install -y pgpool2` from PGDG. Do NOT install `postgresql-16-pgpool2` (extension-only package) |
 | **Cannot connect via VIP** | VIP on wrong node / pgpool not started | `ip addr` (who owns .200?), `pcp_watchdog_info`, `systemctl status pgpool` |
 | **pool_passwd auth fails** | MD5 vs SCRAM mismatch | This repo uses a plaintext `pool_passwd` + `pool_hba.conf` (SCRAM-safe); keep file perms 600 |
 | **pgBackRest fails** | SSH keys / stanza missing | Run `stanza-create` first; `sudo -iu postgres pgbackrest --stanza=kyc info`; check `repo1-host` |
