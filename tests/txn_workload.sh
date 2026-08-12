@@ -45,12 +45,13 @@ else
 fi
 
 # Credential fallback: if PGPASSWORD/PGPASSFILE are not set, source the
-# working pgpool_admin password from the local pool_passwd (never printed).
+# working pgpool_admin password from a DB node's pool_passwd (never printed).
 # Path differs by distro: /etc/pgpool-II (RHEL) vs /etc/pgpool2 (Debian).
 if [ -z "${PGPASSWORD:-}" ] && [ -z "${PGPASSFILE:-}" ]; then
+    # Try to fetch from db2 (watchdog leader, known to have pool_passwd)
     for PF in /etc/pgpool-II/pool_passwd /etc/pgpool2/pool_passwd; do
-        if [ -f "$PF" ]; then
-            export PGPASSWORD=$(grep "^pgpool_admin:" "$PF" | cut -d: -f2)
+        if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.122.151 "[ -f $PF ]" 2>/dev/null; then
+            export PGPASSWORD=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@192.168.122.151 "grep '^pgpool_admin:' $PF | cut -d: -f2" 2>/dev/null)
             break
         fi
     done
