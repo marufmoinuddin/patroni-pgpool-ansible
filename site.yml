@@ -11,5 +11,5 @@
 # ClickHouse/Grafana/VictoriaMetrics saturated br1 (2 vCPU) and wedged its
 # sshd path (Test 2 root cause). Do NOT re-enable without an explicit
 # decision + br1 resize / metrics-stack split. See README §12.8.
-#- import_playbook: 08_Install_Pmm_Monitoring.yml
+#- import_playbook: 07_Install_Pmm_Monitoring.yml
 - import_playbook: 06_Configure_Cluster_Health.yml
