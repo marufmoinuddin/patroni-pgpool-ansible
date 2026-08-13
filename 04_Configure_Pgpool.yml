@@ -15,9 +15,9 @@
     pg_md5_bin: "/usr/bin/pg_md5"
     if_cmd_path: "/usr/sbin"
     arping_path: "/usr/sbin"
-    psql_path: "{{ '/usr/bin/psql' if ansible_os_family == 'Debian' else '/usr/pgsql-16/bin/psql' }}"
+    psql_path: "{{ '/usr/bin/psql' if ansible_os_family == 'Debian' else '/usr/pgsql-' ~ pg_version ~ '/bin/psql' }}"
     # Pgpool users (from variables.yaml)
-    pgpool_admin_user: "pgpool_admin"
+    pgpool_admin_user: "{{ pgpool_admin_user }}"
     pgpool_admin_password: "{{ pgpool_admin_password }}"
     pcp_user: "{{ pcp_user }}"
     pcp_password: "{{ pcp_password }}"
@@ -29,7 +29,7 @@
     # below because ansible_default_ipv4.interface is only available after
     # fact gathering (not at play-vars load time).
     vip_cidr: "{{ vip_cidr }}"
-    pgpool_port: 9999
+    pgpool_port: "{{ pgpool_port }}"
     pcp_port: "{{ pcp_port }}"
     wd_port: "{{ wd_port }}"
 
@@ -119,8 +119,8 @@
     - name: Install Pgpool-II (RHEL/CentOS)
       dnf:
         name:
-          - percona-pgpool-II-pg16
-          - percona-pgpool-II-pg16-extensions
+          - percona-pgpool-II-pg{{ pg_version }}
+          - percona-pgpool-II-pg{{ pg_version }}-extensions
         state: present
       when: ansible_os_family == "RedHat"
 
@@ -155,7 +155,7 @@
     # 2. CREATE PGROOL USERS IN POSTGRESQL (ON PRIMARY)
     # ============================================================
     # NOTE: psql is NOT on PATH for the postgres user on a clean RHEL install.
-    # Use the absolute path (RHEL: /usr/pgsql-16/bin/psql, Debian: /usr/bin/psql).
+    # Use the absolute path (RHEL: /usr/pgsql-{{ pg_version }}/bin/psql, Debian: /usr/bin/psql).
     # We must target the *current* Patroni leader (which may not be db1 after failover).
     - name: Discover current Patroni leader via REST API
       shell: |

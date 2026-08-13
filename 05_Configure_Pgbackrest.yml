@@ -233,7 +233,7 @@
     - variables.yaml
   vars:
     scope: "{{ patroni_scope }}"
-    pgversion: "16"
+    pgversion: "{{ pg_version }}"
     data_dir: "{{ '/postgres/data/' ~ pgversion ~ '/' ~ scope if ansible_os_family == 'Debian' else '/var/lib/pgsql/' ~ pgversion ~ '/data/' ~ scope }}"
     ssh_dir: "{{ '/var/lib/postgresql/.ssh' if ansible_os_family == 'Debian' else '/var/lib/pgsql/.ssh' }}"
 
@@ -439,11 +439,15 @@
     - variables.yaml
   vars:
     scope: "{{ patroni_scope }}"
-    pgversion: "16"
+    pgversion: "{{ pg_version }}"
     patroni_config_file: /etc/patroni/patroni.yml
     data_dir: "{{ '/postgres/data/' ~ pgversion ~ '/' ~ scope if ansible_os_family == 'Debian' else '/var/lib/pgsql/' ~ pgversion ~ '/data/' ~ scope }}"
 
   tasks:
+    # Aligned with 03_Configure_Patroni.yml, which ships archive_mode: "off" as
+    # the no-pgBackRest default. Running this play re-enables archiving and swaps
+    # the commands for pgbackrest archive-push/archive-get (archive_command under
+    # postgresql.parameters, restore_command under postgresql.recovery_conf).
     - name: Update Patroni configuration for pgBackRest archiving
       command: >
         patronictl -c {{ patroni_config_file }} edit-config 

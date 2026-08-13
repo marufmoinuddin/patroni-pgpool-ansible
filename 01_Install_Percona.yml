@@ -56,7 +56,7 @@
         enabled: false
       loop:
         - patroni
-        - postgresql-16
+        - postgresql-{{ pg_version }}
         - pgpool
         - pgpool2
         - etcd
@@ -95,15 +95,15 @@
       ansible.builtin.apt:
         name:
           - patroni
-          - postgresql-16
-          - postgresql-16-pgpool2
-          - postgresql-client-16
+          - postgresql-{{ pg_version }}
+          - postgresql-{{ pg_version }}-pgpool2
+          - postgresql-client-{{ pg_version }}
           - postgresql-common
           - postgresql-client-common
           - libpgpool2
           - percona-patroni
-          - percona-postgresql-16
-          - percona-postgresql-client-16
+          - percona-postgresql-{{ pg_version }}
+          - percona-postgresql-client-{{ pg_version }}
         state: absent
         purge: yes
       ignore_errors: true
@@ -122,11 +122,11 @@
       ansible.builtin.dnf:
         name:
           - patroni
-          - postgresql16
-          - postgresql16-server
-          - postgresql16-contrib
+          - postgresql{{ pg_version }}
+          - postgresql{{ pg_version }}-server
+          - postgresql{{ pg_version }}-contrib
           - percona-patroni
-          - percona-postgresql16-server
+          - percona-postgresql{{ pg_version }}-server
         state: absent
         disable_gpg_check: true
       ignore_errors: true
@@ -135,7 +135,7 @@
     - name: Purge Pgpool packages (RHEL/CentOS)
       ansible.builtin.dnf:
         name:
-          - percona-pgpool-II-pg16
+          - percona-pgpool-II-pg{{ pg_version }}
         state: absent
         disable_gpg_check: true
       ignore_errors: true
@@ -156,10 +156,10 @@
         path: "{{ item }}"
         state: absent
       loop:
-        - /var/lib/postgresql/16
-        - /var/lib/postgresql/16/main
+        - /var/lib/postgresql/{{ pg_version }}
+        - /var/lib/postgresql/{{ pg_version }}/main
         - /postgres/data
-        - /etc/postgresql/16
+        - /etc/postgresql/{{ pg_version }}
       ignore_errors: true
       when: ansible_os_family == "Debian"
 
@@ -168,9 +168,9 @@
         path: "{{ item }}"
         state: absent
       loop:
-        - /var/lib/pgsql/16
-        - /var/lib/pgsql/16/data
-        - /var/lib/pgsql/16/data/{{ patroni_scope }}"
+        - /var/lib/pgsql/{{ pg_version }}
+        - /var/lib/pgsql/{{ pg_version }}/data
+        - /var/lib/pgsql/{{ pg_version }}/data/{{ patroni_scope }}
       ignore_errors: true
       when: ansible_os_family == "RedHat"
 
@@ -239,8 +239,8 @@
         deb: /tmp/percona-release_latest.deb
       when: ansible_os_family == "Debian"
 
-    - name: Enable Percona PostgreSQL 16 repository (Debian)
-      ansible.builtin.shell: percona-release setup ppg-16
+    - name: Enable Percona PostgreSQL {{ pg_version }} repository (Debian)
+      ansible.builtin.shell: percona-release setup ppg-{{ pg_version }}
       when: ansible_os_family == "Debian"
       changed_when: true
 
@@ -257,8 +257,8 @@
         disable_gpg_check: true
       when: ansible_os_family == "RedHat"
 
-    - name: Enable Percona PostgreSQL 16 repository (RHEL/CentOS)
-      ansible.builtin.shell: percona-release setup ppg-16
+    - name: Enable Percona PostgreSQL {{ pg_version }} repository (RHEL/CentOS)
+      ansible.builtin.shell: percona-release setup ppg-{{ pg_version }}
       when: ansible_os_family == "RedHat"
       changed_when: true
 
@@ -267,19 +267,19 @@
         update_cache: yes
       when: ansible_os_family == "Debian"
 
-    - name: Install Percona PostgreSQL 16 packages (Debian/Ubuntu)
+    - name: Install Percona PostgreSQL {{ pg_version }} packages (Debian/Ubuntu)
       ansible.builtin.apt:
         name:
-          - percona-postgresql-16
-          - percona-postgresql-client-16
+          - percona-postgresql-{{ pg_version }}
+          - percona-postgresql-client-{{ pg_version }}
         state: present
       when: ansible_os_family == "Debian"
 
-    - name: Install Percona PostgreSQL 16 packages (RHEL/CentOS)
+    - name: Install Percona PostgreSQL {{ pg_version }} packages (RHEL/CentOS)
       ansible.builtin.dnf:
         name:
-          - percona-postgresql16-server
-          - percona-postgresql16-contrib
+          - percona-postgresql{{ pg_version }}-server
+          - percona-postgresql{{ pg_version }}-contrib
         state: present
         disable_gpg_check: true
       when: ansible_os_family == "RedHat"
@@ -360,7 +360,7 @@
     - name: Install Pgpool-II (RHEL/CentOS)
       ansible.builtin.dnf:
         name:
-          - percona-pgpool-II-pg16
+          - percona-pgpool-II-pg{{ pg_version }}
         state: present
         disable_gpg_check: true
       when: ansible_os_family == "RedHat"
@@ -368,7 +368,7 @@
     - name: Install Percona pg_stat_monitor (RHEL/CentOS)
       ansible.builtin.dnf:
         name:
-          - percona-pg_stat_monitor16
+          - percona-pg_stat_monitor{{ pg_version }}
         state: present
         disable_gpg_check: true
       when: ansible_os_family == "RedHat"
@@ -377,7 +377,7 @@
     # Skip for now - PMM client still works without it
     - name: Skip pg_stat_monitor on Debian
       debug:
-        msg: "Skipping percona-pg-stat-monitor16 on Debian (package may not exist)"
+        msg: "Skipping percona-pg-stat-monitor{{ pg_version }} on Debian (package may not exist)"
       when: ansible_os_family == "Debian"
 
     - name: Install docker.io for PMM client (Debian/Ubuntu)

@@ -8,8 +8,8 @@
   vars:
     pg_pmm_user_password: "{{ pg_pmm_user_password }}"
     pmm_admin_password: "{{ pmm_admin_password }}"
-    pmm_server_port: 443
-    pmm_server_version: "3"
+    pmm_server_port: "{{ pmm_server_port }}"
+    pmm_server_version: "{{ pmm_server_version }}"
     scope: "{{ patroni_scope }}"
     pgversion: "{{ pg_version }}"
 
@@ -185,12 +185,14 @@
   hosts: pg_nodes
   become: true
   gather_facts: true
+  vars_files:
+    - variables.yaml
   vars:
-    pgversion: "16"
+    pgversion: "{{ pg_version }}"
   tasks:
-    - name: Install percona-pg_stat_monitor16 package (RHEL/CentOS only)
+    - name: Install percona-pg_stat_monitor{{ pg_version }} package (RHEL/CentOS only)
       package:
-        name: percona-pg_stat_monitor16
+        name: percona-pg_stat_monitor{{ pg_version }}
         state: present
       when: ansible_os_family == "RedHat"
 
@@ -198,7 +200,7 @@
     # Skip for now - PMM client still works without it
     - name: Skip pg_stat_monitor on Debian
       debug:
-        msg: "Skipping percona-pg_stat_monitor16 on Debian (package may not exist)"
+        msg: "Skipping percona-pg_stat_monitor{{ pg_version }} on Debian (package may not exist)"
       when: ansible_os_family == "Debian"
 
     - name: Enable PMM client repository (Debian/Ubuntu)
@@ -235,7 +237,7 @@
     pg_pmm_user_password: "{{ pg_pmm_user_password }}"
     pmm_server_host: "{{ hostvars[groups['pg_backrest'][0]]['ansible_host'] }}"
     pmm_admin_password: "{{ pmm_admin_password }}"
-    pmm_server_port: 443
+    pmm_server_port: "{{ pmm_server_port }}"
     scope: "{{ patroni_scope }}"
     pgversion: "{{ pg_version }}"
     pg_data_dir: "{{ '/postgres/data/' ~ pgversion ~ '/' ~ scope if ansible_os_family == 'Debian' else '/var/lib/pgsql/' ~ pgversion ~ '/data/' ~ scope }}"

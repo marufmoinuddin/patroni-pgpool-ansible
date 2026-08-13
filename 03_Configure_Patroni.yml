@@ -421,10 +421,16 @@
                         autovacuum_vacuum_scale_factor: 0.1
                         autovacuum_analyze_scale_factor: 0.05
                         # --- ARCHIVE ---
-                        archive_mode: "on"
+                        # No-pgBackRest default: archiving is OFF. Without
+                        # pgBackRest nothing consumes the local archive, so WAL
+                        # would pile up forever with no cleanup (disk-bloat
+                        # risk) and no PITR benefit (no base backups to restore
+                        # to). Patroni HA (streaming + pg_rewind) does not need
+                        # archiving. If 05_Configure_Pgbackrest.yml is run, it
+                        # re-enables archive_mode and sets the pgbackrest
+                        # archive-push/archive-get commands.
+                        archive_mode: "off"
                         archive_timeout: 600s
-                        archive_command: "pgbackrest --stanza={{ patroni_scope }} archive-push %p"
-                        restore_command: "timeout 60 pgbackrest --stanza={{ patroni_scope }} archive-get %f %p"
 
             initdb:
                 - encoding: UTF8
