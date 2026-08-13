@@ -57,7 +57,7 @@
           - "Data dir: {{ data_dir }}"
 
     # ============================================================
-    # 1. INSTALL PGROOL-II FROM PERCONA REPOS (RHEL) / PGDG (Debian)
+    # 1. INSTALL PGPOOL-II FROM PERCONA REPOS (RHEL) / PGDG (Debian)
     # ============================================================
     - name: Remove any old pgpool2 apt pin that conflicts with PGDG 4.7
       ansible.builtin.file:
@@ -68,15 +68,20 @@
     - name: Add PGDG apt repository for pgpool2 4.7 (Debian/Ubuntu)
       block:
         - name: Install prerequisites for PGDG repo
-          apt:
+          ansible.builtin.apt:
             name:
               - wget
               - gnupg
               - lsb-release
             state: present
             update_cache: yes
-          when: ansible_os_family == "Debian"
           register: pgdg_prereqs
+
+        - name: Remove stale/corrupt PGDG keyring (idempotency safety)
+          ansible.builtin.file:
+            path: /usr/share/keyrings/pgdg.gpg
+            state: absent
+          when: pgdg_prereqs is changed
 
         - name: Add PGDG GPG key
           ansible.builtin.shell: |
@@ -84,14 +89,20 @@
           args:
             creates: /usr/share/keyrings/pgdg.gpg
 
+        - name: Verify PGDG keyring is non-empty
+          ansible.builtin.stat:
+            path: /usr/share/keyrings/pgdg.gpg
+          register: pgdg_key_stat
+          failed_when: pgdg_key_stat.stat.size == 0
+
         - name: Add PGDG apt repository
           ansible.builtin.apt_repository:
-            repo: "deb https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+            repo: "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
             state: present
             filename: pgdg
 
         - name: Update apt cache after adding PGDG repo
-          apt:
+          ansible.builtin.apt:
             update_cache: yes
       when: ansible_os_family == "Debian"
 
