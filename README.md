@@ -571,7 +571,13 @@ patroni-pgpool-ansible/
 ├── 06_Install_Pmm_Monitoring.yml   ← PMM Server (Docker) + PMM Client
 ├── 07_Configure_Cluster_Health.yml ← Self-healing timers + health monitor + Prometheus metrics
 ├── 08_Configure_Switchover_Signal.yml ← Patroni on_role_change callback → pgpool active notification
-├── tests/                          ← Fault-injection harness (failover_test_harness.sh, step4_observer.sh, txn_workload.sh)
+├── tests/                          ← Fault-injection + realistic-app harness
+│   ├── bulk_failover_test.py       ← Failover trigger: kill the leader/VIP node (failover-only)
+│   ├── app_simulator.py            ← Realistic customer app: fires purchases, never waits
+│   ├── failover_test_harness.sh    ← Shell fault-injection harness (Tests 1-5)
+│   ├── step4_observer.sh           ← Split-brain / routing monitor
+│   ├── txn_workload.sh             ← Transaction write workload
+│   └── artifacts/                  ← Test reports (.report.txt, .summary.json, .events)
 ├── docs/                           ← Validation reports and procedures
 │   ├── FAILOVER_TESTING.md         ← How to run Tests 1-5
 │   └── step6_failover_report.md    ← 5/5 PASS evidence with timelines, durability, split-brain
@@ -990,7 +996,7 @@ bootstrap:
         wal_log_hints: "on"
         logging_collector: "on"
         max_wal_size: '10GB'
-        archive_mode: "on"
+        archive_mode: "off"
         archive_timeout: 600s
         archive_command: "cp -f %p /postgres/pgbackup/maruf/archive/%f"
 
@@ -1637,6 +1643,24 @@ This architecture has been **deployed end-to-end and validated on real hardware 
 | **Test 3** | **Mixed/cascading failure** (etcd node loss + 30% packet loss on survivors) | **DCS (etcd) is a single point of failure for write availability** — 2/3 PG nodes healthy, 0 writable primaries because 2-of-3 etcd quorum unreachable. Cluster correctly chose safe-unavailable (0 data loss) | Documented as architectural limitation; mitigations: dedicated etcd witnesses, decoupled DCS failure domain, 5-node etcd topology |
 | **Test 4** | Durable false-positive logging (soak instrumentation) | Built append-only event log + Prometheus counters; smoke test found a 2nd bug: a timed-out leader REST probe produced an empty `LEADER_ROLE=""` which skipped the writability guard, so a stuck leader passed as healthy | **Fixed:** empty/timeout → `role="unknown"` → NOT writable (fc0a736) |
 | **Live discovery** | Manual planned switchover (`patronictl switchover`) | pgpool has no active signal on clean switchover — relies on `sr_check` polling → **~4 min write-availability gap** observed (15:29:05 → 15:33:22) | **Fixed & verified:** `pgpool_role_signal.sh` callback (Patroni `on_role_change` → `pcp_promote_node` on all pgpool nodes) + `sr_check_period 10→3` → **~3–4 s gap, 999/999 writes survived, 0 lost, no split-brain** (PLA 1, 2026-08-12) |
+
+### Realistic Application Failover Testing (2026-08-20)
+
+Beyond the shell harness, the stack is validated with a **realistic customer-facing application** — two Python scripts that together prove what real users experience during a failover:
+
+| Script | Role |
+|--------|------|
+| [`tests/bulk_failover_test.py`](tests/bulk_failover_test.py) | **Failover trigger** — detects the leader (or pgpool/VIP node) and kills it. Failover-only; no data/verify logic. |
+| [`tests/app_simulator.py`](tests/app_simulator.py) | **Realistic customer app** — fires purchase requests at the VIP with **zero cluster awareness**; never waits for the DB. |
+
+**Why two scripts:** a failover-aware script that "waits for the DB" does **not** prove production failover — a real customer never waits. The app simulator behaves exactly like a real app: it keeps trying to buy during the incident and records every outcome (SUCCESS / FAILED / UNCERTAIN), then audits that no customer was wrongly charged.
+
+**Validated results (all scenarios):**
+- ✅ **Zero data loss** across crash (SIGKILL), graceful, extreme (3 sequential failovers), and keep-down (node stays dead) scenarios — 50/50 confirmed, 0 lost, 0 extra, balance exact
+- ✅ **Money consistency** — balance always equals `seed − (purchases × price)`; no lost charge, no double charge
+- ✅ **Real failovers observed** — leader changes like `db1 → db2`, `db2 → db1 → db2 → db3` (timeline advanced each time)
+- ✅ **Self-healing** — killed nodes rejoin as replicas and catch up from archive (0 lag after recovery); pgpool watchdog moved the VIP (db1 → db2) when the VIP node died
+- ⚠️ **Read availability measured, not assumed** — concurrent read probe through the VIP: **89%** on default config, **95.71%** after tuning `health_check_period` (leader-failover scenario). Reads are highly available, not perfect; the gap is understood and tunable.
 
 > ⚠️ **Honest caveat — async replication.** Replication is asynchronous (`synchronous_standby_names` not set). A transaction committed on the old primary moments before a power loss can, in the worst case, be absent from the promoted replica. Zero lost commits were observed across all five runs, but that is empirical evidence, not a design guarantee: for zero-RPO the stack must be switched to synchronous replication. The 34–38s write interruption is the client-visible failover window (pgpool health-polling + Patroni election + attach cycle) — not zero downtime; stateful clients must retry.
 
