@@ -87,6 +87,40 @@ import threading
 import time
 from datetime import datetime, timezone
 
+# ---------------------------------------------------------------------------
+# ANSI color helpers (auto-disabled when not a TTY)
+# ---------------------------------------------------------------------------
+def _use_color():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class C:
+    """ANSI color codes. Colors are only emitted when stdout is a TTY."""
+    _on = _use_color()
+    RESET = "\033[0m" if _on else ""
+    BOLD = "\033[1m" if _on else ""
+    DIM = "\033[2m" if _on else ""
+    RED = "\033[31m" if _on else ""
+    GREEN = "\033[32m" if _on else ""
+    YELLOW = "\033[33m" if _on else ""
+    BLUE = "\033[34m" if _on else ""
+    MAGENTA = "\033[35m" if _on else ""
+    CYAN = "\033[36m" if _on else ""
+    WHITE = "\033[37m" if _on else ""
+    BOLD_RED = "\033[1;31m" if _on else ""
+    BOLD_GREEN = "\033[1;32m" if _on else ""
+    BOLD_YELLOW = "\033[1;33m" if _on else ""
+    BOLD_CYAN = "\033[1;36m" if _on else ""
+    BOLD_MAGENTA = "\033[1;35m" if _on else ""
+    BG_RED = "\033[41m" if _on else ""
+    BG_GREEN = "\033[42m" if _on else ""
+    BG_YELLOW = "\033[43m" if _on else ""
+
+
+def colorize(text, code):
+    """Wrap text in a color code + reset (no-op when colors are off)."""
+    return f"{code}{text}{C.RESET}" if C._on else text
+
 try:
     import psycopg2
     from psycopg2 import sql
@@ -160,20 +194,59 @@ def parse_size(s):
 
 
 class Logger:
-    """Timestamped event logger: mirrors to stdout and an events file."""
+    """Timestamped event logger: mirrors to stdout and an events file.
+    Console output is colorized by event type; the events file stays plain."""
 
     def __init__(self, events_path):
         self._fh = open(events_path, "a", buffering=1) if events_path else None
 
     def log(self, msg):
         line = f"{utcnow()} {msg}"
-        print(line, flush=True)
+        print(self._colorize(line), flush=True)
         if self._fh:
             self._fh.write(line + "\n")
 
     def close(self):
         if self._fh:
             self._fh.close()
+
+    @staticmethod
+    def _colorize(line):
+        """Apply a color to the whole line based on its leading event tag."""
+        if not C._on:
+            return line
+        tag = line.split(" ", 2)[-1].split(" ", 1)[0] if " " in line else line
+        # Match the event keyword that follows the timestamp.
+        body = line.split(" ", 2)[-1] if " " in line else line
+        if body.startswith("CONFIRMED"):
+            return colorize(line, C.GREEN)
+        if body.startswith("SEED"):
+            return colorize(line, C.BLUE)
+        if body.startswith(("KILL_TRIGGER", "KILL_EXEC", "RESTORE")):
+            return colorize(line, C.BOLD_RED)
+        if body.startswith("FAILED"):
+            return colorize(line, C.RED)
+        if body.startswith("RECONNECTED"):
+            return colorize(line, C.CYAN)
+        if body.startswith("RECONNECT_FAIL"):
+            return colorize(line, C.YELLOW)
+        if body.startswith("READ_PROBE FAIL"):
+            return colorize(line, C.BOLD_YELLOW)
+        if body.startswith("READ_MONITOR"):
+            return colorize(line, C.MAGENTA)
+        if body.startswith("UNCERTAIN"):
+            return colorize(line, C.BOLD_MAGENTA)
+        if body.startswith("INSUFFICIENT"):
+            return colorize(line, C.YELLOW)
+        if body.startswith("FATAL"):
+            return colorize(line, C.BOLD_RED)
+        if body.startswith("WARN"):
+            return colorize(line, C.YELLOW)
+        if body.startswith("INFO"):
+            return colorize(line, C.CYAN)
+        if body.startswith("CLEAN"):
+            return colorize(line, C.BLUE)
+        return line
 
 
 # ---------------------------------------------------------------------------
@@ -872,63 +945,159 @@ def write_report(args, client, report, logger):
     r = report
     v = r["verification"]
     unit = "purchase" if r["scenario"] == "purchase" else "row"
-    lines = []
-    lines.append("=" * 62)
-    lines.append("BULK FAILOVER TEST REPORT")
-    lines.append("=" * 62)
-    lines.append(f"client            : {r['client']}")
-    lines.append(f"vip               : {r['vip']}")
-    lines.append(f"scenario          : {r['scenario']}")
-    lines.append(f"table             : {r['table']}")
-    lines.append(f"target bytes      : {r['target_bytes']} ({human_bytes(r['target_bytes'])})")
-    lines.append(f"payload size      : {r['payload_size']} ({human_bytes(r['payload_size'])})")
-    lines.append(f"kill mode         : {r['kill_mode']}  kill_at={r['kill_at_bytes']} ({human_bytes(r['kill_at_bytes'] or 0)})")
-    lines.append(f"kill target       : {r.get('kill_target', 'leader')}")
-    lines.append(f"kills performed   : {r['kills_performed']} (requested {r['kill_count']})")
-    lines.append(f"keep-down mode    : {r.get('keep_down', False)} (killed nodes stay down until restored)")
-    lines.append(f"leader before kill: {r['leader_before']}")
-    lines.append(f"leader after      : {r['leader_after']}")
+    verdict = r["verdict"]
+    is_pass = verdict == "PASS"
+
+    # --- helpers to build a line both plain and colorized -------------------
+    def kv(label, value, value_color=None):
+        plain = f"{label:<22}: {value}"
+        if C._on and value_color:
+            return plain, colorize(f"{label:<22}: ", C.DIM) + colorize(str(value), value_color)
+        return plain, plain
+
+    def section(title):
+        bar = "-" * 62
+        plain = f"{bar}\n{title}\n{bar}"
+        if C._on:
+            return plain, colorize(bar, C.DIM) + "\n" + colorize(title, C.BOLD_CYAN) + "\n" + colorize(bar, C.DIM)
+        return plain, plain
+
+    plain_lines = []
+    color_lines = []
+
+    # --- header banner ------------------------------------------------------
+    bar = "=" * 62
+    title = "BULK FAILOVER TEST REPORT"
+    plain_lines += [bar, title, bar]
+    if C._on:
+        color_lines += [
+            colorize(bar, C.BOLD_CYAN),
+            colorize(title, C.BOLD + C.BOLD_CYAN),
+            colorize(bar, C.BOLD_CYAN),
+        ]
+    else:
+        color_lines += [bar, title, bar]
+
+    # --- run config ---------------------------------------------------------
+    p, c = section("RUN CONFIG")
+    plain_lines.append(p); color_lines.append(c)
+    for label, val in [
+        ("client", r["client"]),
+        ("vip", r["vip"]),
+        ("scenario", r["scenario"]),
+        ("table", r["table"]),
+        ("target bytes", f"{r['target_bytes']} ({human_bytes(r['target_bytes'])})"),
+        ("payload size", f"{r['payload_size']} ({human_bytes(r['payload_size'])})"),
+        ("kill mode", f"{r['kill_mode']}  kill_at={r['kill_at_bytes']} ({human_bytes(r['kill_at_bytes'] or 0)})"),
+        ("kill target", r.get("kill_target", "leader")),
+        ("kills performed", f"{r['kills_performed']} (requested {r['kill_count']})"),
+        ("keep-down mode", r.get("keep_down", False)),
+    ]:
+        p, c = kv(label, val)
+        plain_lines.append(p); color_lines.append(c)
+
+    # --- failover / leader info --------------------------------------------
+    p, c = section("FAILOVER")
+    plain_lines.append(p); color_lines.append(c)
+    for label, val in [
+        ("leader before kill", r["leader_before"]),
+        ("leader after", r["leader_after"]),
+        ("failover observed", r["failover_observed"]),
+    ]:
+        p, c = kv(label, val, C.BOLD_GREEN if val is True else (C.BOLD_RED if val is False else None))
+        plain_lines.append(p); color_lines.append(c)
     if r.get("leader_sequence"):
         seq_str = " -> ".join(m["member"] for m in r["leader_sequence"])
         seq_str += f" -> {r['leader_after']['member']}" if r.get("leader_after") else ""
-        lines.append(f"leader sequence   : {seq_str}")
-    lines.append(f"failover observed : {r['failover_observed']}")
-    lines.append("-" * 62)
-    lines.append(f"{unit}s written     : {r['rows_written']}")
-    lines.append(f"bytes written     : {r['bytes_written']} ({human_bytes(r['bytes_written'])})")
-    lines.append(f"confirmed {unit}s  : {r['confirmed_count']}")
-    lines.append(f"failed (unconfirmed): {r['failed_count']}")
-    lines.append(f"uncertain commits : {r['uncertain_count']}")
-    lines.append(f"insufficient funds: {r['insufficient_count']}")
-    lines.append("-" * 62)
-    lines.append("VERIFICATION (via pgpool VIP)")
-    lines.append(f"{unit}s in DB       : {v['rows_in_db']}")
-    lines.append(f"bytes in DB       : {v['bytes_in_db']} ({human_bytes(v['bytes_in_db'])})")
-    lines.append(f"LOST (confirmed but missing): {v['lost_count']}")
+        p, c = kv("leader sequence", seq_str, C.BOLD_MAGENTA)
+        plain_lines.append(p); color_lines.append(c)
+
+    # --- write results ------------------------------------------------------
+    p, c = section("WRITE RESULTS")
+    plain_lines.append(p); color_lines.append(c)
+    for label, val in [
+        (f"{unit}s written", r["rows_written"]),
+        ("bytes written", f"{r['bytes_written']} ({human_bytes(r['bytes_written'])})"),
+        (f"confirmed {unit}s", r["confirmed_count"]),
+        ("failed (unconfirmed)", r["failed_count"]),
+        ("uncertain commits", r["uncertain_count"]),
+        ("insufficient funds", r["insufficient_count"]),
+    ]:
+        p, c = kv(label, val)
+        plain_lines.append(p); color_lines.append(c)
+
+    # --- verification -------------------------------------------------------
+    p, c = section("VERIFICATION (via pgpool VIP)")
+    plain_lines.append(p); color_lines.append(c)
+    for label, val in [
+        (f"{unit}s in DB", v["rows_in_db"]),
+        ("bytes in DB", f"{v['bytes_in_db']} ({human_bytes(v['bytes_in_db'])})"),
+    ]:
+        p, c = kv(label, val)
+        plain_lines.append(p); color_lines.append(c)
+
+    lost = v["lost_count"]
+    p, c = kv("LOST (confirmed but missing)", lost, C.BOLD_RED if lost else C.BOLD_GREEN)
+    plain_lines.append(p); color_lines.append(c)
     if v["lost_ids"]:
-        lines.append(f"  lost ids: {v['lost_ids'][:20]}{' ...' if len(v['lost_ids']) > 20 else ''}")
-    lines.append(f"EXTRA (in DB, unconfirmed) : {v['extra_count']}")
+        p, c = kv("  lost ids", v["lost_ids"][:20])
+        plain_lines.append(p); color_lines.append(c)
+
+    extra = v["extra_count"]
+    p, c = kv("EXTRA (in DB, unconfirmed)", extra, C.BOLD_YELLOW if extra else C.BOLD_GREEN)
+    plain_lines.append(p); color_lines.append(c)
     if v["extra_ids"]:
-        lines.append(f"  extra ids: {v['extra_ids'][:20]}{' ...' if len(v['extra_ids']) > 20 else ''}")
-    lines.append(f"integrity failures : {v['integrity_fail_count']}")
+        p, c = kv("  extra ids", v["extra_ids"][:20])
+        plain_lines.append(p); color_lines.append(c)
+
+    ifail = v["integrity_fail_count"]
+    p, c = kv("integrity failures", ifail, C.BOLD_RED if ifail else C.BOLD_GREEN)
+    plain_lines.append(p); color_lines.append(c)
+
     if v["balance_ok"] is not None:
-        lines.append(f"balance check      : {'OK' if v['balance_ok'] else 'MISMATCH'} "
-                     f"(current={v['balance_current_cents']} expected={v['balance_expected_cents']})")
+        bok = v["balance_ok"]
+        p, c = kv("balance check", f"{'OK' if bok else 'MISMATCH'} "
+                   f"(current={v['balance_current_cents']} expected={v['balance_expected_cents']})",
+                   C.BOLD_GREEN if bok else C.BOLD_RED)
+        plain_lines.append(p); color_lines.append(c)
+
+    # --- read monitor -------------------------------------------------------
     if r.get("read_monitor"):
         rm = r["read_monitor"]
-        lines.append(f"read probes        : {rm['total_probes']} total, {rm['failed_probes']} failed")
-        lines.append(f"read availability : {rm['availability_pct']}%  (reads never disrupted unless VIP node down)")
-        lines.append(f"read latency      : avg {rm['avg_latency_ms']}ms, max {rm['max_latency_ms']}ms")
+        p, c = section("READ MONITOR (concurrent probe through VIP)")
+        plain_lines.append(p); color_lines.append(c)
+        for label, val in [
+            ("read probes", f"{rm['total_probes']} total, {rm['failed_probes']} failed"),
+            ("read availability", f"{rm['availability_pct']}%"),
+            ("read latency", f"avg {rm['avg_latency_ms']}ms, max {rm['max_latency_ms']}ms"),
+        ]:
+            p, c = kv(label, val, C.BOLD_GREEN if rm['availability_pct'] >= 99 else C.BOLD_YELLOW)
+            plain_lines.append(p); color_lines.append(c)
         if rm["failures"]:
-            lines.append(f"  read outage windows: {rm['failures'][:5]}")
+            p, c = kv("  read outage windows", rm["failures"][:5])
+            plain_lines.append(p); color_lines.append(c)
         if rm.get("worst_seconds"):
-            lines.append(f"  worst seconds (failed/total): "
-                         + ", ".join(f"{s} {f}/{t}" for s, t, f in rm["worst_seconds"][:5]))
-    lines.append("=" * 62)
-    lines.append(f"RESULT: {r['verdict']}")
-    lines.append("=" * 62)
-    report_txt = "\n".join(lines)
-    print("\n" + report_txt)
+            p, c = kv("  worst seconds (failed/total)",
+                      ", ".join(f"{s} {f}/{t}" for s, t, f in rm["worst_seconds"][:5]))
+            plain_lines.append(p); color_lines.append(c)
+
+    # --- verdict banner -----------------------------------------------------
+    plain_lines.append("=" * 62)
+    plain_lines.append(f"RESULT: {verdict}")
+    plain_lines.append("=" * 62)
+    if C._on:
+        vcolor = C.BG_GREEN + C.BOLD if is_pass else C.BG_RED + C.BOLD
+        color_lines.append(colorize("=" * 62, C.DIM))
+        color_lines.append(colorize(f"  RESULT: {verdict}  ", vcolor))
+        color_lines.append(colorize("=" * 62, C.DIM))
+    else:
+        color_lines.append("=" * 62)
+        color_lines.append(f"RESULT: {verdict}")
+        color_lines.append("=" * 62)
+
+    report_txt = "\n".join(plain_lines)
+    console_txt = "\n".join(color_lines)
+    print("\n" + console_txt)
     with open(base + ".report.txt", "w") as fh:
         fh.write(report_txt + "\n")
     logger.log(f"REPORT verdict={r['verdict']} lost={v['lost_count']} extra={v['extra_count']} "
@@ -1019,9 +1188,9 @@ def main():
     if args.no_kill:
         args.kill_at_bytes = None
     elif args.kill_at_bytes is not None and args.kill_at_bytes >= args.target_bytes:
-        print(f"WARN: --kill-at-bytes ({args.kill_at_bytes}) >= --target-bytes "
+        print(colorize(f"WARN: --kill-at-bytes ({args.kill_at_bytes}) >= --target-bytes "
               f"({args.target_bytes}); forcing kill at {args.target_bytes // 2} "
-              f"so the failover happens mid-write.")
+              f"so the failover happens mid-write.", C.BOLD_YELLOW))
         args.kill_at_bytes = args.target_bytes // 2
 
     # Compute the kill points (byte offsets where the leader is killed).
@@ -1036,18 +1205,18 @@ def main():
             int(args.target_bytes * i / (args.kill_count + 1))
             for i in range(1, args.kill_count + 1)
         ]
-        print(f"INFO: EXTREME test with {args.kill_count} sequential kills at "
-              f"{', '.join(human_bytes(p) for p in args.kill_points)}")
+        print(colorize(f"INFO: EXTREME test with {args.kill_count} sequential kills at "
+              f"{', '.join(human_bytes(p) for p in args.kill_points)}", C.BOLD_CYAN))
 
     if args.keep_down and args.kill_count >= len(args.nodes) - 1:
-        print(f"WARN: --keep-down with --kill-count {args.kill_count} on {len(args.nodes)} nodes "
-              f"may lose etcd quorum (need >= 2 nodes up); reconnects may fail.")
+        print(colorize(f"WARN: --keep-down with --kill-count {args.kill_count} on {len(args.nodes)} nodes "
+              f"may lose etcd quorum (need >= 2 nodes up); reconnects may fail.", C.BOLD_YELLOW))
 
     if not args.password:
         pw = fetch_pgpool_password(args.nodes, args.ssh_user)
         if pw:
             args.password = pw
-            print(f"INFO: pgpool_admin password auto-fetched from pool_passwd")
+            print(colorize(f"INFO: pgpool_admin password auto-fetched from pool_passwd", C.CYAN))
         else:
             sys.stderr.write(
                 "ERROR: no DB password. Set PGPASSWORD or --password "
@@ -1057,7 +1226,7 @@ def main():
 
     if args.clean:
         # Standalone clean mode: wipe old data, then exit (no artifact files created).
-        print(f"{utcnow()} === bulk_failover_test CLEAN mode ===")
+        print(colorize(f"{utcnow()} === bulk_failover_test CLEAN mode ===", C.BOLD_BLUE if hasattr(C, 'BOLD_BLUE') else C.BOLD_CYAN))
         ok = clean_old_data(args, lambda m: print(f"{utcnow()} {m}"))
         sys.exit(0 if ok else 1)
 
