@@ -457,8 +457,8 @@
         --force
       ignore_errors: yes
 
-    - name: Reload Patroni config
-      command: patronictl -c {{ patroni_config_file }} reload {{ scope }} --force
+    - name: Restart Patroni service to apply changes
+      command: patronictl -c {{ patroni_config_file }} restart {{ scope }} --force
       ignore_errors: yes
 
 - name: Set up SSH Authentication Between PostgreSQL Nodes and pgBackRest Server

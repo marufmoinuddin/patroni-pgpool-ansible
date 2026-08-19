@@ -5,7 +5,7 @@
 # variables - NEVER commit this file!
 variables.yaml
 !variables.yaml.example
-
+artifacts/
 # Inventories - deployment-specific, never commit
 hosts.ini
 hosts
