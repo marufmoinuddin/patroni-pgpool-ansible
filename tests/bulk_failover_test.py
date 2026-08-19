@@ -60,6 +60,7 @@
 #   python3 bulk_failover_test.py --kill-mode stop             # graceful systemctl stop
 #   python3 bulk_failover_test.py --kill-count 3               # EXTREME: 3 sequential failovers in one run
 #   python3 bulk_failover_test.py --kill-count 2 --keep-down   # EXTREME: killed leaders stay DOWN until the end
+#   python3 bulk_failover_test.py --kill-target pgpool        # kill the pgpool/VIP node (VIP-failover read test)
 #   python3 bulk_failover_test.py --verify-payload             # also re-read + md5 every row
 #   python3 bulk_failover_test.py --read-interval 0.2          # concurrent read probe (default on)
 #   python3 bulk_failover_test.py --clean                      # wipe old table data + artifact files
@@ -225,13 +226,35 @@ def kill_leader(leader_ip, mode, ssh_user, keep_down=False):
     return run_ssh(leader_ip, cmd, ssh_user)
 
 
-def restore_nodes(ips, ssh_user):
-    """Bring kept-down (masked) nodes back: unmask + start patroni."""
+def restore_nodes(killed, ssh_user):
+    """Bring kept-down (masked) nodes back: unmask + start the killed service.
+    killed is a list of (ip, service) pairs."""
     restored = []
-    for ip in ips:
-        rc, out, err = run_ssh(ip, "systemctl unmask patroni && systemctl start patroni", ssh_user)
+    for ip, svc in killed:
+        rc, out, err = run_ssh(ip, f"systemctl unmask {svc} && systemctl start {svc}", ssh_user)
         restored.append((ip, rc == 0))
     return restored
+
+
+def find_pgpool_vip_node(nodes, ssh_user, vip):
+    """Return the IP of the node currently hosting the pgpool VIP."""
+    for ip in nodes:
+        rc, out, _ = run_ssh(ip, f"ip -4 addr show | grep -q '{vip}' && echo yes || echo no", ssh_user)
+        if rc == 0 and "yes" in out:
+            return ip
+    return None
+
+
+def kill_pgpool(ip, ssh_user, keep_down=False):
+    """Stop pgpool on the given node (triggers watchdog VIP failover to another node).
+    Returns ((rc, out, err), service_name)."""
+    svc = "pgpool2"
+    rc, _, _ = run_ssh(ip, f"systemctl is-active {svc}", ssh_user)
+    if rc != 0:
+        svc = "pgpool"
+    if keep_down:
+        run_ssh(ip, f"systemctl mask {svc}", ssh_user)
+    return run_ssh(ip, f"systemctl stop {svc}", ssh_user), svc
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +445,7 @@ class ReadMonitor:
         while not self._stop.is_set():
             ts = utcnow()
             ok, err = False, ""
+            t0 = time.monotonic()
             try:
                 if self._conn is None or self._conn.closed:
                     self._conn = connect(self.args, self.client + "_reader")
@@ -437,8 +461,9 @@ class ReadMonitor:
                 except Exception:
                     pass
                 self._conn = None
+            latency_ms = (time.monotonic() - t0) * 1000.0
             with self._lock:
-                self.probes.append((ts, ok, err))
+                self.probes.append((ts, ok, err, latency_ms))
             if not ok:
                 self.logger.log(f"READ_PROBE FAIL {ts}: {err}")
             time.sleep(self.interval)
@@ -446,14 +471,33 @@ class ReadMonitor:
     def summary(self):
         with self._lock:
             total = len(self.probes)
-            failed = sum(1 for _, ok, _ in self.probes if not ok)
-            failures = [(ts, err) for ts, ok, err in self.probes if not ok]
+            failed = sum(1 for _, ok, _, _ in self.probes if not ok)
+            failures = [(ts, err) for ts, ok, err, _ in self.probes if not ok]
+            latencies = [lat for _, ok, _, lat in self.probes if ok]
+            # per-second success rate (second -> [total, failed])
+            per_sec = {}
+            for ts, ok, _, _ in self.probes:
+                sec = ts[:19]   # YYYY-MM-DDTHH:MM:SS
+                if sec not in per_sec:
+                    per_sec[sec] = [0, 0]
+                per_sec[sec][0] += 1
+                if not ok:
+                    per_sec[sec][1] += 1
+            worst_secs = sorted(
+                ((s, t, f) for s, (t, f) in per_sec.items() if f > 0),
+                key=lambda x: -x[2],
+            )[:10]
         avail = (total - failed) / total * 100 if total else 0.0
+        avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
+        max_lat = max(latencies) if latencies else 0.0
         return {
             "total_probes": total,
             "failed_probes": failed,
             "availability_pct": round(avail, 2),
+            "avg_latency_ms": round(avg_lat, 2),
+            "max_latency_ms": round(max_lat, 2),
             "failures": failures[:50],
+            "worst_seconds": worst_secs,
         }
 
 
@@ -525,27 +569,46 @@ def write_phase(args, client, logger, start_id):
     kill_points = list(getattr(args, "kill_points", None) or [])
     kill_index = 0
     kills_performed = 0
-    killed_ips = []        # nodes kept down (--keep-down) until the test ends
+    killed_ips = []        # (ip, service) kept down (--keep-down) until the test ends
     leader_sequence = []   # (member, host) of the leader before each kill
     leader_after = None
 
     while bytes_written < args.target_bytes:
         # --- auto-kill trigger (fires at each kill point, mid-write) -------
         if kill_index < len(kill_points) and bytes_written >= kill_points[kill_index]:
-            member, ip = find_leader(args.nodes, args.ssh_user, args.patroni_cfg)
-            leader_sequence.append((member, ip))
-            if ip:
-                logger.log(
-                    f"KILL_TRIGGER #{kill_index + 1} bytes={bytes_written} ({human_bytes(bytes_written)}) "
-                    f"leader={member}@{ip} mode={args.kill_mode}"
-                )
-                rc, out, err = kill_leader(ip, args.kill_mode, args.ssh_user, keep_down=args.keep_down)
-                kills_performed += 1
-                killed_ips.append(ip)
-                logger.log(f"KILL_EXEC #{kill_index + 1} rc={rc} {err or out}"
-                           + (" (kept down)" if args.keep_down else ""))
+            if args.kill_target == "pgpool":
+                # Kill the pgpool/VIP node: the watchdog should move the VIP to
+                # another pgpool node. Tests VIP-failover read disruption.
+                ip = find_pgpool_vip_node(args.nodes, args.ssh_user, args.vip)
+                member = "pgpool"
+                leader_sequence.append((member, ip))
+                if ip:
+                    logger.log(
+                        f"KILL_TRIGGER #{kill_index + 1} bytes={bytes_written} ({human_bytes(bytes_written)}) "
+                        f"target=pgpool node={ip} mode=stop"
+                    )
+                    (rc, out, err), svc = kill_pgpool(ip, args.ssh_user, keep_down=args.keep_down)
+                    kills_performed += 1
+                    killed_ips.append((ip, svc))
+                    logger.log(f"KILL_EXEC #{kill_index + 1} rc={rc} {err or out}"
+                               + (" (kept down)" if args.keep_down else ""))
+                else:
+                    logger.log(f"KILL_TRIGGER #{kill_index + 1} WARN: could not find pgpool VIP node")
             else:
-                logger.log(f"KILL_TRIGGER #{kill_index + 1} WARN: could not resolve leader — no kill performed")
+                member, ip = find_leader(args.nodes, args.ssh_user, args.patroni_cfg)
+                leader_sequence.append((member, ip))
+                if ip:
+                    logger.log(
+                        f"KILL_TRIGGER #{kill_index + 1} bytes={bytes_written} ({human_bytes(bytes_written)}) "
+                        f"leader={member}@{ip} mode={args.kill_mode}"
+                    )
+                    rc, out, err = kill_leader(ip, args.kill_mode, args.ssh_user, keep_down=args.keep_down)
+                    kills_performed += 1
+                    killed_ips.append((ip, "patroni"))
+                    logger.log(f"KILL_EXEC #{kill_index + 1} rc={rc} {err or out}"
+                               + (" (kept down)" if args.keep_down else ""))
+                else:
+                    logger.log(f"KILL_TRIGGER #{kill_index + 1} WARN: could not resolve leader — no kill performed")
             kill_index += 1
 
         payload = os.urandom(args.payload_size)
@@ -769,6 +832,7 @@ def build_report(args, client, result, verify, read_summary=None):
         "kill_at_bytes": args.kill_at_bytes,
         "kill_count": args.kill_count,
         "keep_down": args.keep_down,
+        "kill_target": args.kill_target,
         "kill_performed": kill_performed,
         "kills_performed": kills_performed,
         "leader_before": {"member": leader_before[0], "host": leader_before[1]} if leader_before else None,
@@ -819,6 +883,7 @@ def write_report(args, client, report, logger):
     lines.append(f"target bytes      : {r['target_bytes']} ({human_bytes(r['target_bytes'])})")
     lines.append(f"payload size      : {r['payload_size']} ({human_bytes(r['payload_size'])})")
     lines.append(f"kill mode         : {r['kill_mode']}  kill_at={r['kill_at_bytes']} ({human_bytes(r['kill_at_bytes'] or 0)})")
+    lines.append(f"kill target       : {r.get('kill_target', 'leader')}")
     lines.append(f"kills performed   : {r['kills_performed']} (requested {r['kill_count']})")
     lines.append(f"keep-down mode    : {r.get('keep_down', False)} (killed nodes stay down until restored)")
     lines.append(f"leader before kill: {r['leader_before']}")
@@ -853,8 +918,12 @@ def write_report(args, client, report, logger):
         rm = r["read_monitor"]
         lines.append(f"read probes        : {rm['total_probes']} total, {rm['failed_probes']} failed")
         lines.append(f"read availability : {rm['availability_pct']}%  (reads never disrupted unless VIP node down)")
+        lines.append(f"read latency      : avg {rm['avg_latency_ms']}ms, max {rm['max_latency_ms']}ms")
         if rm["failures"]:
             lines.append(f"  read outage windows: {rm['failures'][:5]}")
+        if rm.get("worst_seconds"):
+            lines.append(f"  worst seconds (failed/total): "
+                         + ", ".join(f"{s} {f}/{t}" for s, t, f in rm["worst_seconds"][:5]))
     lines.append("=" * 62)
     lines.append(f"RESULT: {r['verdict']}")
     lines.append("=" * 62)
@@ -912,6 +981,9 @@ def main():
                     help="do NOT auto-kill; stop the leader externally while this runs")
     ap.add_argument("--kill-mode", choices=["kill", "stop"], default="kill",
                     help="kill = systemctl kill -s SIGKILL patroni (crash); stop = graceful stop")
+    ap.add_argument("--kill-target", choices=["leader", "pgpool"], default="leader",
+                    help="what to kill at each kill point: leader = Patroni DB leader; "
+                         "pgpool = the pgpool/VIP node (tests VIP-failover read disruption)")
     ap.add_argument("--nodes", nargs="+", default=DEFAULT_NODES,
                     help="DB node IPs (for SSH leader detection + kill)")
     ap.add_argument("--ssh-user", default=DEFAULT_SSH_USER, help="SSH user for DB nodes")
