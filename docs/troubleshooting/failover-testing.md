@@ -6,8 +6,8 @@ This document is the canonical home for all **failover-testing procedure and
 methodology** for the Patroni + pgpool-II cluster. For the actual validation
 results — 5 consecutive power-loss failover iterations, zero lost commits,
 zero split-brain, per-iteration timelines and durability tables — see
-**[Step 6 Failover Validation Report](step6_failover_report.md)**.
-The automated harness referenced in Test 5 lives in [`tests/`](../tests/).
+**[Step 6 Failover Validation Report](../solutions/failover-test-report.md)**.
+The automated harness referenced in Test 5 lives in [`tests/`](../../tests/).
 
 ---
 
@@ -126,7 +126,7 @@ is the connection teardown/retry latency of in-flight client connections.
 
 The repository ships an automated failover test harness for reproducible
 kill → observe → recover → verify cycles. See
-[`step6_failover_report.md`](step6_failover_report.md) for a full
+[`step6_failover_report.md`](../solutions/failover-test-report.md) for a full
 5-iteration validation run with zero lost commits and zero split-brain.
 
 ```bash
@@ -167,6 +167,6 @@ bash tests/failover_test_harness.sh --targets db1 --action vm-start --execute
 
 | Document | Purpose |
 |----------|---------|
-| [`step6_failover_report.md`](step6_failover_report.md) | Actual validation results: 5/5 iterations PASS, per-iteration timelines, durability + split-brain evidence, architectural limitations |
-| [`charts/`](charts/) | AntV G2 v5 visualizations of the Step 6 results (failover performance, rejoin vs budget, durability) |
-| [`../tests/`](../tests/) | The automated harness: `failover_test_harness.sh`, `step4_observer.sh`, `txn_workload.sh`, `step3_setup.sh` |
+| [`step6_failover_report.md`](../solutions/failover-test-report.md) | Actual validation results: 5/5 iterations PASS, per-iteration timelines, durability + split-brain evidence, architectural limitations |
+| [`charts/`](../charts/) | AntV G2 v5 visualizations of the Step 6 results (failover performance, rejoin vs budget, durability) |
+| [`../../tests/`](../../tests/) | The automated harness: `failover_test_harness.sh`, `step4_observer.sh`, `txn_workload.sh`, `step3_setup.sh` |
