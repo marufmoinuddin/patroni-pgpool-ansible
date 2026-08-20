@@ -159,7 +159,7 @@ This single question drives every other difference between the two options.
    restart a crashed local Patroni member and alert on quorum loss.
 
 8. **Proven in this repo.** 5 consecutive power-loss failovers, zero lost commits,
-   zero split-brain — all documented in `docs/step6_failover_report.md`.
+   zero split-brain — all documented in [`failover-test-report.md`](failover-test-report.md).
 
 #### Cons
 

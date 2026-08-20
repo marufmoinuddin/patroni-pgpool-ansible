@@ -57,13 +57,13 @@ Prove the HA stack self-heals correctly through **5 consecutive kill/recovery it
 
 <iframe src="charts/failover_performance.html" width="100%" height="460" style="border:1px solid #d0d7de;border-radius:6px" title="Failover performance"></iframe>
 
-[Open chart: failover_performance.html](charts/failover_performance.html)
+[Open chart: failover_performance.html](../charts/failover_performance.html)
 
 **Killed-node rejoin vs the ≤10-minute budget** (all 5 landed 36–40s — a 15× margin)
 
 <iframe src="charts/rejoin_budget.html" width="100%" height="460" style="border:1px solid #d0d7de;border-radius:6px" title="Rejoin vs budget"></iframe>
 
-[Open chart: rejoin_budget.html](charts/rejoin_budget.html)
+[Open chart: rejoin_budget.html](../charts/rejoin_budget.html)
 
 ## 4. Per-iteration timelines (UTC)
 
@@ -128,7 +128,7 @@ Note: Iteration 3/4 EXTRA=1 rows are IDs present in the table but absent from th
 
 <iframe src="charts/durability_confirmed.html" width="100%" height="460" style="border:1px solid #d0d7de;border-radius:6px" title="Durability confirmed"></iframe>
 
-[Open chart: durability_confirmed.html](charts/durability_confirmed.html)
+[Open chart: durability_confirmed.html](../charts/durability_confirmed.html)
 
 ## 6. Split-brain evidence
 

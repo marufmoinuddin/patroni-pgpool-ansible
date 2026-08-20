@@ -115,7 +115,7 @@ db3:  no lock, follows db1                  → PostgreSQL REPLICA
 
 > **Measured in this repo (5/5 PASS):** failover T0→T4 = **38–43 s**, median 40 s,
 > write interruption 34–38 s, **0 lost commits** across ~104,000 writes, **0 split-brain**
-> across 3,600 observer samples. See `docs/step6_failover_report.md`.
+> across 3,600 observer samples. See [`failover-test-report.md`](failover-test-report.md).
 
 ### 3.3 What "promotion" actually does
 
@@ -328,7 +328,7 @@ There is no free lunch:
 | **"Can we prefer a specific node?"** | **Yes.** `failover_priority` + `ttl` let you wait for a preferred leader and fail over only after a timeout. |
 | **"What if a node comes back?"** | **Automatic rejoin** via `pg_rewind` — no full re-basebackup, no manual steps. |
 | **"Is it observable?"** | `patronictl list`, REST API `:8008`, `patronictl history`, plus this repo's health timers + Prometheus metrics. |
-| **"Is it proven?"** | **Yes.** 5/5 consecutive power-loss failovers, 0 lost commits, 0 split-brain, 36–40 s rejoin. See `docs/step6_failover_report.md`. |
+| **"Is it proven?"** | **Yes.** 5/5 consecutive power-loss failovers, 0 lost commits, 0 split-brain, 36–40 s rejoin. See [`failover-test-report.md`](failover-test-report.md). |
 
 ### 6.3 The one-line pitch
 
